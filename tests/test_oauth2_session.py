@@ -9,13 +9,14 @@ from unittest import TestCase
 
 from unittest import mock
 
-from oauthlib.common import urlencode
+from oauthlib.common import urlencode, urldecode
 from oauthlib.oauth2 import TokenExpiredError, OAuth2Error
 from oauthlib.oauth2 import MismatchingStateError
 from oauthlib.oauth2 import WebApplicationClient, MobileApplicationClient
 from oauthlib.oauth2 import LegacyApplicationClient, BackendApplicationClient
 from requests_oauthlib import OAuth2Session, TokenUpdated
 import requests
+from requests.exceptions import UnrewindableBodyError
 
 from requests.auth import _basic_auth_str
 
@@ -523,6 +524,281 @@ class OAuth2SessionTest(TestCase):
             else:
                 sess.fetch_token(url)
             self.assertTrue(sess.authorized)
+
+
+class CountingStream:
+    """A file-like object that records how often and from where it is read."""
+
+    def __init__(self, content):
+        self._content = content
+        self._position = 0
+        self.reads = []
+        self.seeks = []
+
+    def read(self, size=-1):
+        self.reads.append(self._position)
+        if size is None or size < 0:
+            size = len(self._content) - self._position
+        chunk = self._content[self._position : self._position + size]
+        self._position += len(chunk)
+        return chunk
+
+    def tell(self):
+        return self._position
+
+    def seek(self, position, whence=0):
+        self.seeks.append((position, whence))
+        if whence == 0:
+            self._position = position
+        elif whence == 1:
+            self._position += position
+        else:
+            self._position = len(self._content) + position
+        return self._position
+
+
+class UnrewindableStream(CountingStream):
+    def seek(self, position, whence=0):
+        self.seeks.append((position, whence))
+        raise OSError("stream is not seekable")
+
+
+class OAuth2UploadRefreshTest(TestCase):
+    """Uploads must keep their body ownership across an automatic refresh."""
+
+    client_id = "someclientid"
+    client_secret = "someclientsecret"
+
+    def setUp(self):
+        self.expired_token = {
+            "token_type": "Bearer",
+            "access_token": "expired-access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": "-1",
+            "expires_at": time.time() - 10,
+        }
+        self.fresh_token = {
+            "token_type": "Bearer",
+            "access_token": "fresh-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+            "expires_at": time.time() + 3600,
+        }
+
+    def _session(self, refresh_response=None, token_updater=None):
+        session = OAuth2Session(
+            client_id=self.client_id,
+            token=dict(self.expired_token),
+            auto_refresh_url="https://token.example/refresh",
+            token_updater=token_updater
+            if token_updater is not None
+            else (lambda t: None),
+        )
+        session.requests = []
+
+        def fake_send(prepared, **kwargs):
+            session.requests.append(prepared)
+            response = mock.MagicMock()
+            response.status_code = 200
+            if prepared.url.startswith("https://token.example/refresh"):
+                response.text = json.dumps(
+                    self.fresh_token if refresh_response is None else refresh_response
+                )
+            else:
+                response.text = "ok"
+            return response
+
+        session.send = fake_send
+        return session
+
+    def _payload(self, session):
+        token_requests = [
+            r for r in session.requests if r.url.startswith("https://token.example/")
+        ]
+        resource_requests = [
+            r
+            for r in session.requests
+            if not r.url.startswith("https://token.example/")
+        ]
+        return token_requests, resource_requests
+
+    def test_refresh_receives_only_token_parameters(self):
+        session = self._session()
+        uploaded = CountingStream(b"binary-payload")
+
+        session.post(
+            "https://api.example/upload?resource=1",
+            data={"description": "hello"},
+            files={"file": ("data.bin", uploaded)},
+            headers={"X-Resource-Header": "resource-only"},
+            params={"tenant": "resource-only"},
+            json={"ignored": "resource-only"},
+            allow_redirects=False,
+            stream=True,
+            hooks={"response": []},
+            auth=("client", "secret"),
+        )
+
+        token_requests, resource_requests = self._payload(session)
+        self.assertEqual(len(token_requests), 1)
+        self.assertEqual(len(resource_requests), 1)
+
+        token_request = token_requests[0]
+        token_body = token_request.body
+        if isinstance(token_body, bytes):
+            token_body = token_body.decode("utf-8")
+        token_params = dict(urldecode(token_body))
+        self.assertEqual(token_params["grant_type"], "refresh_token")
+        self.assertEqual(token_params["refresh_token"], "refresh-token")
+        for leaked in (
+            "description",
+            "json",
+            "params",
+            "stream",
+            "allow_redirects",
+            "hooks",
+            "tenant",
+        ):
+            self.assertNotIn(leaked, token_params)
+        self.assertNotIn("X-Resource-Header", token_request.headers)
+
+        resource_request = resource_requests[0]
+        self.assertIn("tenant=resource-only", resource_request.url)
+        self.assertEqual(
+            resource_request.headers["Authorization"],
+            "Bearer fresh-access-token",
+        )
+        self.assertEqual(resource_request.headers["X-Resource-Header"], "resource-only")
+
+    def test_refresh_does_not_read_upload_stream(self):
+        session = self._session()
+        uploaded = CountingStream(b"binary-payload")
+
+        session.post(
+            "https://api.example/upload",
+            files={"file": ("data.bin", uploaded)},
+        )
+
+        _, resource_requests = self._payload(session)
+        self.assertEqual(len(resource_requests), 1)
+        # Exactly one read, by requests when building the multipart body.
+        self.assertEqual(len(uploaded.reads), 1)
+        self.assertEqual(uploaded.reads[0], 0)
+        self.assertIn(b"binary-payload", resource_requests[0].body)
+
+    def test_refresh_restores_stream_before_second_send(self):
+        session = self._session()
+        uploaded = CountingStream(b"binary-payload")
+
+        session.post(
+            "https://api.example/upload",
+            files={"file": ("data.bin", uploaded)},
+        )
+
+        # The refresh must not consume the stream, so its position is still
+        # at the original offset when the business request is built.
+        self.assertEqual(uploaded.seeks, [])
+        _, resource_requests = self._payload(session)
+        self.assertEqual(len(resource_requests), 1)
+
+    def test_refresh_failure_leaves_body_untouched(self):
+        session = self._session(refresh_response={"error": "invalid_grant"})
+        uploaded = CountingStream(b"binary-payload")
+
+        with self.assertRaises(OAuth2Error):
+            session.post(
+                "https://api.example/upload",
+                files={"file": ("data.bin", uploaded)},
+            )
+
+        self.assertEqual(uploaded.reads, [])
+        self.assertEqual(uploaded.tell(), 0)
+        token_requests, resource_requests = self._payload(session)
+        self.assertEqual(len(token_requests), 1)
+        self.assertEqual(resource_requests, [])
+
+    def test_token_updated_allows_caller_to_retry(self):
+        session = self._session(token_updater=None)
+        session.token_updater = None
+        uploaded = CountingStream(b"binary-payload")
+
+        with self.assertRaises(TokenUpdated) as raised:
+            session.post(
+                "https://api.example/upload",
+                files={"file": ("data.bin", uploaded)},
+            )
+
+        self.assertEqual(raised.exception.token["access_token"], "fresh-access-token")
+        self.assertEqual(uploaded.reads, [])
+        _, resource_requests = self._payload(session)
+        self.assertEqual(resource_requests, [])
+
+        # The caller can retry with the refreshed token and the same stream.
+        session.token = raised.exception.token
+        session.token_updater = lambda token: None
+        session.post(
+            "https://api.example/upload",
+            files={"file": ("data.bin", uploaded)},
+        )
+        token_requests, resource_requests = self._payload(session)
+        self.assertEqual(len(token_requests), 1)
+        self.assertEqual(len(resource_requests), 1)
+        self.assertIn(b"binary-payload", resource_requests[0].body)
+
+    def test_unrewindable_stream_raises_instead_of_sending_truncated_body(self):
+        session = self._session()
+        uploaded = UnrewindableStream(b"binary-payload")
+
+        def consuming_hook(url, headers, data):
+            uploaded.read()
+            return url, headers, data
+
+        session.register_compliance_hook("protected_request", consuming_hook)
+
+        with self.assertRaises(UnrewindableBodyError):
+            session.post(
+                "https://api.example/upload",
+                files={"file": ("data.bin", uploaded)},
+            )
+
+        _, resource_requests = self._payload(session)
+        self.assertEqual(resource_requests, [])
+        self.assertEqual(uploaded.reads, [0])
+
+    def test_unrewindable_stream_after_successful_refresh_is_reported(self):
+        session = self._session()
+        uploaded = UnrewindableStream(b"binary-payload")
+
+        def consuming_refresh_hook(url, headers, body):
+            uploaded.read()
+            return url, headers, body
+
+        session.register_compliance_hook(
+            "refresh_token_request", consuming_refresh_hook
+        )
+
+        with self.assertRaises(UnrewindableBodyError):
+            session.post(
+                "https://api.example/upload",
+                files={"file": ("data.bin", uploaded)},
+            )
+
+        token_requests, resource_requests = self._payload(session)
+        self.assertEqual(len(token_requests), 1)
+        self.assertEqual(resource_requests, [])
+        self.assertEqual(uploaded.reads, [0])
+
+    def test_data_stream_is_not_replayed_into_token_request(self):
+        session = self._session()
+        uploaded = CountingStream(b"raw-payload")
+
+        session.put("https://api.example/upload", data=uploaded)
+
+        token_requests, resource_requests = self._payload(session)
+        self.assertEqual(len(token_requests), 1)
+        self.assertEqual(len(resource_requests), 1)
+        self.assertEqual(uploaded.reads, [])
+        self.assertIs(resource_requests[0].body, uploaded)
 
 
 class OAuth2SessionNetrcTest(OAuth2SessionTest):

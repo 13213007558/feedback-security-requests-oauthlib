@@ -1,12 +1,125 @@
 import logging
+from collections.abc import Mapping
 
 from oauthlib.common import generate_token, urldecode
 from oauthlib.oauth2 import WebApplicationClient, InsecureTransportError
 from oauthlib.oauth2 import LegacyApplicationClient
 from oauthlib.oauth2 import TokenExpiredError, is_secure_transport
 import requests
+from requests.exceptions import UnrewindableBodyError
 
 log = logging.getLogger(__name__)
+
+
+# Arguments that may be forwarded from a protected-resource request to the
+# token endpoint during an automatic refresh. Everything else (``params``,
+# ``files``, ``json``, ``stream``, ``allow_redirects``, ``hooks``, cookies and
+# resource headers) belongs exclusively to the protected-resource request.
+_TOKEN_ENDPOINT_REQUEST_KWARGS = frozenset({"timeout", "verify", "proxies", "cert"})
+
+
+def _is_readable(obj):
+    return callable(getattr(obj, "read", None))
+
+
+def _iter_file_values(files):
+    """Yield the file objects from a requests ``files`` argument."""
+    if not files:
+        return
+
+    entries = files.items() if isinstance(files, Mapping) else files
+    try:
+        entries = list(entries)
+    except TypeError:
+        return
+
+    for entry in entries:
+        if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+            continue
+        value = entry[1]
+        # requests accepts (filename, fileobj[, content_type[, headers]])
+        # as the value of a ``files`` entry.
+        if isinstance(value, (tuple, list)):
+            if len(value) < 2:
+                continue
+            value = value[1]
+        yield value
+
+
+def _iter_resource_streams(data, files):
+    """Yield caller-owned streams from the protected request body."""
+    seen = set()
+    candidates = []
+    if _is_readable(data):
+        candidates.append(data)
+    elif isinstance(data, Mapping):
+        candidates.extend(data.values())
+    elif isinstance(data, (list, tuple)):
+        for entry in data:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                candidates.append(entry[1])
+    candidates.extend(_iter_file_values(files))
+
+    for candidate in candidates:
+        if _is_readable(candidate) and id(candidate) not in seen:
+            seen.add(id(candidate))
+            yield candidate
+
+
+def _snapshot_stream_positions(data, files):
+    """Record positions of streams owned by the caller's request body."""
+    snapshots = []
+    for stream in _iter_resource_streams(data, files):
+        tell = getattr(stream, "tell", None)
+        if not callable(tell):
+            snapshots.append((stream, None))
+            continue
+        try:
+            snapshots.append((stream, tell()))
+        except (OSError, TypeError, ValueError):
+            snapshots.append((stream, None))
+    return snapshots
+
+
+def _restore_stream_positions(snapshots):
+    """Restore caller-owned stream positions before sending the request.
+
+    A refresh must never consume part of an upload. If a stream moved and
+    cannot be rewound, refuse to send it rather than uploading truncated
+    content.
+    """
+    for stream, expected in snapshots:
+        if expected is None:
+            continue
+        tell = getattr(stream, "tell", None)
+        if not callable(tell):
+            continue
+        try:
+            current = tell()
+        except (OSError, TypeError, ValueError):
+            current = None
+        if current == expected:
+            continue
+
+        seek = getattr(stream, "seek", None)
+        if not callable(seek):
+            raise UnrewindableBodyError(
+                "The request body stream was consumed while refreshing the "
+                "OAuth token and cannot be rewound. Refusing to send a "
+                "truncated request body; reset the stream to position %r and "
+                "retry." % (expected,)
+            )
+        try:
+            seek(expected)
+            if callable(tell) and tell() != expected:
+                raise OSError("seek did not restore the stream position")
+        except (OSError, TypeError, ValueError) as exc:
+            raise UnrewindableBodyError(
+                "The request body stream was consumed while refreshing the "
+                "OAuth token and could not be restored to position %r. "
+                "Refusing to send a truncated request body; reset the stream "
+                "and retry." % (expected,)
+            ) from exc
 
 
 class TokenUpdated(Warning):
@@ -45,7 +158,7 @@ class OAuth2Session(requests.Session):
         state=None,
         token_updater=None,
         pkce=None,
-        **kwargs
+        **kwargs,
     ):
         """Construct a new OAuth 2 client session.
 
@@ -87,7 +200,9 @@ class OAuth2Session(requests.Session):
         self._pkce = pkce
 
         if self._pkce not in ["S256", "plain", None]:
-            raise AttributeError("Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce))
+            raise AttributeError(
+                "Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce)
+            )
 
         # Ensure that requests doesn't do any automatic auth. See #278.
         # The default behavior can be re-enabled by setting auth to None.
@@ -185,8 +300,7 @@ class OAuth2Session(requests.Session):
             self._code_verifier = self._client.create_code_verifier(43)
             kwargs["code_challenge_method"] = self._pkce
             kwargs["code_challenge"] = self._client.create_code_challenge(
-                code_verifier=self._code_verifier,
-                code_challenge_method=self._pkce
+                code_verifier=self._code_verifier, code_challenge_method=self._pkce
             )
         return (
             self._client.prepare_request_uri(
@@ -194,7 +308,7 @@ class OAuth2Session(requests.Session):
                 redirect_uri=self.redirect_uri,
                 scope=self.scope,
                 state=state,
-                **kwargs
+                **kwargs,
             ),
             state,
         )
@@ -217,7 +331,7 @@ class OAuth2Session(requests.Session):
         include_client_id=None,
         client_secret=None,
         cert=None,
-        **kwargs
+        **kwargs,
     ):
         """Generic method for fetching an access token from the token endpoint.
 
@@ -354,7 +468,7 @@ class OAuth2Session(requests.Session):
             body=body,
             redirect_uri=self.redirect_uri,
             include_client_id=include_client_id,
-            **kwargs
+            **kwargs,
         )
 
         headers = headers or {
@@ -387,7 +501,7 @@ class OAuth2Session(requests.Session):
             verify=verify,
             proxies=proxies,
             cert=cert,
-            **request_kwargs
+            **request_kwargs,
         )
 
         log.debug("Request to fetch token completed with status %s.", r.status_code)
@@ -430,7 +544,8 @@ class OAuth2Session(requests.Session):
         headers=None,
         verify=None,
         proxies=None,
-        **kwargs
+        cert=None,
+        **kwargs,
     ):
         """Fetch a new access token using a refresh token.
 
@@ -443,6 +558,7 @@ class OAuth2Session(requests.Session):
         :param headers: A dict of headers to be used by `requests`.
         :param verify: Verify SSL certificate.
         :param proxies: The `proxies` argument will be passed to `requests`.
+        :param cert: Client certificate for mutual TLS.
         :param kwargs: Extra parameters to include in the token request.
         :return: A token dict
         """
@@ -482,6 +598,7 @@ class OAuth2Session(requests.Session):
             verify=verify,
             withhold_token=True,
             proxies=proxies,
+            cert=cert,
         )
         log.debug("Request to refresh token completed with status %s.", r.status_code)
         log.debug("Response headers were %s and content %s.", r.headers, r.text)
@@ -509,56 +626,92 @@ class OAuth2Session(requests.Session):
         client_id=None,
         client_secret=None,
         files=None,
-        **kwargs
+        **kwargs,
     ):
-        """Intercept all requests and add the OAuth 2 token if present."""
+        """Intercept all requests and add the OAuth 2 token if present.
+
+        Protected-resource arguments (``data``, ``files``, ``headers``,
+        ``params``, ``json``, ``stream``, ``allow_redirects``, hooks and
+        cookies) are never forwarded to the token endpoint during an
+        automatic refresh. Only transport-related arguments
+        (``timeout``, ``verify``, ``proxies`` and ``cert``) are shared with
+        the refresh request, and ``auth`` is handled explicitly.
+        """
         if not is_secure_transport(url):
             raise InsecureTransportError()
         if self.token and not withhold_token:
-            log.debug(
-                "Invoking %d protected resource request hooks.",
-                len(self.compliance_hook["protected_request"]),
-            )
-            for hook in self.compliance_hook["protected_request"]:
-                log.debug("Invoking hook %s.", hook)
-                url, headers, data = hook(url, headers, data)
-
-            log.debug("Adding token %s to request.", self.token)
+            # The request body belongs to the caller. Snapshot any streams
+            # before touching the token so that a refresh can never consume
+            # part of an upload, even if a compliance hook reads ``data``.
+            stream_positions = _snapshot_stream_positions(data, files)
             try:
-                url, headers, data = self._client.add_token(
-                    url, http_method=method, body=data, headers=headers
+                log.debug(
+                    "Invoking %d protected resource request hooks.",
+                    len(self.compliance_hook["protected_request"]),
                 )
-            # Attempt to retrieve and save new access token if expired
-            except TokenExpiredError:
-                if self.auto_refresh_url:
-                    log.debug(
-                        "Auto refresh is set, attempting to refresh at %s.",
-                        self.auto_refresh_url,
-                    )
+                for hook in self.compliance_hook["protected_request"]:
+                    log.debug("Invoking hook %s.", hook)
+                    url, headers, data = hook(url, headers, data)
 
-                    # We mustn't pass auth twice.
-                    auth = kwargs.pop("auth", None)
-                    if client_id and client_secret and (auth is None):
-                        log.debug(
-                            'Encoding client_id "%s" with client_secret as Basic auth credentials.',
-                            client_id,
-                        )
-                        auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
-                    token = self.refresh_token(
-                        self.auto_refresh_url, auth=auth, **kwargs
+                log.debug("Adding token %s to request.", self.token)
+                try:
+                    url, headers, data = self._client.add_token(
+                        url, http_method=method, body=data, headers=headers
                     )
-                    if self.token_updater:
+                # Attempt to retrieve and save new access token if expired
+                except TokenExpiredError:
+                    if self.auto_refresh_url:
                         log.debug(
-                            "Updating token to %s using %s.", token, self.token_updater
+                            "Auto refresh is set, attempting to refresh at %s.",
+                            self.auto_refresh_url,
                         )
-                        self.token_updater(token)
-                        url, headers, data = self._client.add_token(
-                            url, http_method=method, body=data, headers=headers
+
+                        # ``auth`` belongs to the token endpoint during an
+                        # automatic refresh. It is removed from the resource
+                        # request so it cannot replace the bearer token, and
+                        # passed explicitly to ``refresh_token`` to avoid
+                        # duplicating the keyword argument.
+                        auth = kwargs.pop("auth", None)
+                        if client_id and client_secret and (auth is None):
+                            log.debug(
+                                'Encoding client_id "%s" with client_secret as Basic auth credentials.',
+                                client_id,
+                            )
+                            auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+                        token_kwargs = {
+                            key: value
+                            for key, value in kwargs.items()
+                            if key in _TOKEN_ENDPOINT_REQUEST_KWARGS
+                        }
+                        token = self.refresh_token(
+                            self.auto_refresh_url, auth=auth, **token_kwargs
                         )
+                        if self.token_updater:
+                            log.debug(
+                                "Updating token to %s using %s.",
+                                token,
+                                self.token_updater,
+                            )
+                            self.token_updater(token)
+                            url, headers, data = self._client.add_token(
+                                url, http_method=method, body=data, headers=headers
+                            )
+                        else:
+                            raise TokenUpdated(token)
                     else:
-                        raise TokenUpdated(token)
-                else:
-                    raise
+                        raise
+            except Exception as exc:
+                # Keep the caller able to retry after a failed refresh or a
+                # TokenUpdated warning. If the stream cannot be rewound,
+                # report that instead of letting a later attempt send a
+                # truncated body silently.
+                try:
+                    _restore_stream_positions(stream_positions)
+                except UnrewindableBodyError as restore_error:
+                    raise restore_error from exc
+                raise
+
+            _restore_stream_positions(stream_positions)
 
         log.debug("Requesting url %s using method %s.", url, method)
         log.debug("Supplying headers %s and data %s", headers, data)

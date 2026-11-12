@@ -1,12 +1,55 @@
+import copy
 import logging
+from base64 import urlsafe_b64encode
+from hashlib import sha256
 
-from oauthlib.common import generate_token, urldecode
+from oauthlib.common import UNICODE_ASCII_CHARACTER_SET, generate_token, urldecode
 from oauthlib.oauth2 import WebApplicationClient, InsecureTransportError
 from oauthlib.oauth2 import LegacyApplicationClient
+from oauthlib.oauth2 import MismatchingStateError
 from oauthlib.oauth2 import TokenExpiredError, is_secure_transport
 import requests
 
+from .oauth2_transaction import (
+    AuthorizationTransaction,
+    AuthorizationTransactionClientMismatchError,
+    AuthorizationTransactionError,
+    AuthorizationTransactionRedirectUriError,
+    AuthorizationTransactionRetryableError,
+)
+
 log = logging.getLogger(__name__)
+
+
+def _code_challenge(code_verifier, method):
+    if method == "plain":
+        return code_verifier
+    digest = sha256(code_verifier.encode("ascii")).digest()
+    return urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _client_type(client):
+    cls = type(client)
+    return "%s.%s" % (cls.__module__, cls.__qualname__)
+
+
+def _same_redirect_endpoint(callback_url, redirect_uri):
+    """Compare scheme, host, path and the redirect URI's own query parameters."""
+    from urllib.parse import parse_qsl, urlparse
+
+    callback = urlparse(callback_url)
+    redirect = urlparse(redirect_uri)
+    if (callback.scheme, callback.netloc, callback.path) != (
+        redirect.scheme,
+        redirect.netloc,
+        redirect.path,
+    ):
+        return False
+    callback_query = dict(parse_qsl(callback.query, keep_blank_values=True))
+    for name, value in parse_qsl(redirect.query, keep_blank_values=True):
+        if callback_query.get(name) != value:
+            return False
+    return True
 
 
 class TokenUpdated(Warning):
@@ -198,6 +241,302 @@ class OAuth2Session(requests.Session):
             ),
             state,
         )
+
+    def create_authorization_transaction(self, url, state=None, **kwargs):
+        """Create persisted per-round-trip authorization material.
+
+        This is the concurrent-safe counterpart of :meth:`authorization_url`.
+        Instead of mutating the session's ``_state`` and PKCE verifier, the
+        returned :class:`~requests_oauthlib.AuthorizationTransaction` owns its
+        own state, PKCE verifier, client identifier, redirect URI and scope.
+        The application should persist it (for example in a server-side
+        session or database) between the authorization redirect and the
+        callback, keyed by :attr:`AuthorizationTransaction.state`.
+
+        The shared session is not modified; ``self.state`` and the legacy
+        ``_code_verifier`` are left untouched.
+
+        :param url: Authorization endpoint url, must be HTTPS.
+        :param state: Optional state value. If not given a secure random
+                      value is generated for this transaction only.
+        :param kwargs: Extra parameters to include in the authorization url.
+        :return: A new :class:`AuthorizationTransaction`.
+        """
+        if getattr(self._client, "grant_type", None) != "authorization_code":
+            raise ValueError(
+                "Authorization transactions require an authorization code client."
+            )
+        if not self.client_id:
+            raise ValueError(
+                "Authorization transactions require a client_id."
+            )
+        if state is None:
+            # Never reuse a fixed session state for two transactions. A later
+            # flow must not be able to overwrite or share an earlier flow's
+            # routing value.
+            state = self.state() if callable(self.state) else generate_token()
+        if not state:
+            raise ValueError("state must be a non-empty string.")
+        scope = kwargs.pop("scope", self.scope)
+        redirect_uri = kwargs.pop("redirect_uri", self.redirect_uri)
+        pkce = kwargs.pop("pkce", self._pkce)
+        if pkce not in ("S256", "plain", None):
+            raise AttributeError(
+                "Wrong value for {}(.., pkce={})".format(self.__class__, pkce)
+            )
+        code_verifier = None
+        code_challenge = None
+        if pkce:
+            code_verifier = generate_token(
+                43, UNICODE_ASCII_CHARACTER_SET + "-._~"
+            )
+            code_challenge = _code_challenge(code_verifier, pkce)
+            kwargs["code_challenge_method"] = pkce
+            kwargs["code_challenge"] = code_challenge
+
+        authorization_url = self._client.prepare_request_uri(
+            url,
+            redirect_uri=redirect_uri,
+            scope=scope,
+            state=state,
+            **kwargs
+        )
+        return AuthorizationTransaction(
+            state=state,
+            authorization_url=authorization_url,
+            client_id=self.client_id,
+            client_type=_client_type(self._client),
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            pkce=pkce,
+            code_challenge=code_challenge,
+            scope=scope,
+        )
+
+    def fetch_token_for_transaction(
+        self,
+        transaction,
+        token_url,
+        authorization_response=None,
+        code=None,
+        update_session_token=True,
+        **kwargs
+    ):
+        """Exchange an authorization callback using its own transaction.
+
+        Unlike :meth:`fetch_token`, this method never reads the session's
+        ``_state`` or ``_code_verifier``.  The state, PKCE verifier, client
+        identifier and redirect URI all come from ``transaction``, so callbacks
+        for concurrently started flows can be processed in any order.
+
+        The transaction must match this session's ``client_id``.  The callback
+        state is checked before anything else and a callback for another
+        transaction leaves this one untouched.  Failed exchanges follow the
+        documented policy:
+
+        * transient failures (HTTP 429, HTTP 5xx and network errors) leave the
+          transaction retryable;
+        * ``invalid_grant``, malformed/other error responses and an exception
+          while parsing a successful response consume the transaction;
+        * a successful exchange consumes the transaction, so duplicate
+          callbacks fail without sending another token request.
+
+        On a retryable failure :class:`AuthorizationTransactionRetryableError`
+        is raised with the original exception as ``__cause__``.  A transaction
+        that is already consumed or currently exchanging raises
+        :class:`AuthorizationTransactionConsumedError` or
+        :class:`AuthorizationTransactionInProgressError`, again without
+        contacting the token endpoint.
+
+        :param transaction: The :class:`AuthorizationTransaction` for this
+                            callback, existing or restored via ``from_dict``.
+        :param token_url: Token endpoint url, must be HTTPS.
+        :param authorization_response: The full callback URL for this
+                                       transaction.
+        :param code: Alternatively, the authorization code itself.
+        :param update_session_token: When true (the default) the returned token
+                                     is also stored on the session. Set to false
+                                     when concurrent exchanges manage tokens
+                                     themselves and must not overwrite each
+                                     other.
+        :param kwargs: Extra parameters passed to :meth:`fetch_token`.
+        :return: A token dict
+        """
+        if not isinstance(transaction, AuthorizationTransaction):
+            raise TypeError("transaction must be an AuthorizationTransaction.")
+        if not is_secure_transport(token_url):
+            raise InsecureTransportError()
+        if transaction.client_id != self.client_id:
+            raise AuthorizationTransactionClientMismatchError()
+        if transaction.client_type and transaction.client_type != _client_type(
+            self._client
+        ):
+            raise AuthorizationTransactionClientMismatchError()
+        if getattr(self._client, "grant_type", None) != "authorization_code":
+            raise AuthorizationTransactionClientMismatchError()
+        protected = {"code", "code_verifier", "state", "redirect_uri", "client_id"}
+        conflicts = sorted(protected.intersection(kwargs))
+        if conflicts:
+            raise ValueError(
+                "Transaction-bound parameters cannot be overridden: %s"
+                % ", ".join(conflicts)
+            )
+
+        previous = transaction._begin_exchange()
+        try:
+            self._validate_transaction_callback(
+                transaction, authorization_response, code
+            )
+        except Exception:
+            transaction._restore(previous)
+            raise
+
+        status_holder = {}
+        try:
+            try:
+                token = self._fetch_token_with_transaction(
+                    transaction,
+                    token_url,
+                    authorization_response,
+                    code,
+                    kwargs,
+                    status_holder,
+                )
+            except AuthorizationTransactionError as exc:
+                transaction._mark_terminal_failure(exc)
+                raise
+            except Exception as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if not isinstance(status_code, int):
+                    status_code = status_holder.get("status_code")
+                if self._is_retryable_exchange_failure(exc, status_code):
+                    transaction._mark_retryable_failure(exc, status_code)
+                    raise AuthorizationTransactionRetryableError() from exc
+                transaction._mark_terminal_failure(exc, status_code)
+                raise
+            else:
+                transaction._consume()
+                if update_session_token:
+                    self.token = token
+                return token
+        finally:
+            # Never leave a transaction stuck in ``exchanging`` after an
+            # unexpected interruption (for example KeyboardInterrupt).
+            if transaction.in_progress:
+                transaction._restore(previous)
+
+    @staticmethod
+    def _validate_transaction_callback(transaction, authorization_response, code):
+        """Validate callback state/redirect URI before contacting the endpoint."""
+        if authorization_response is not None:
+            try:
+                callback_state = AuthorizationTransaction.state_from_response(
+                    authorization_response
+                )
+            except ValueError as exc:
+                raise MismatchingStateError() from exc
+            if not transaction.matches_state(callback_state):
+                raise MismatchingStateError()
+            if transaction.redirect_uri:
+                if not _same_redirect_endpoint(
+                    authorization_response, transaction.redirect_uri
+                ):
+                    raise AuthorizationTransactionRedirectUriError()
+        elif code is None:
+            raise ValueError(
+                "Please supply either code or authorization_response parameters."
+            )
+
+    @staticmethod
+    def _is_retryable_exchange_failure(exc, status_code=None):
+        if isinstance(exc, requests.exceptions.RequestException):
+            return True
+        if getattr(exc, "error", None) in (
+            "temporarily_unavailable",
+            "server_error",
+        ):
+            return True
+        if isinstance(status_code, int) and (
+            status_code in (408, 425, 429) or status_code >= 500
+        ):
+            return True
+        return False
+
+    def _clone_for_transaction(self, transaction):
+        """Build a private session whose OAuth state cannot leak back."""
+        isolated = copy.copy(self)
+        isolated.headers = self.headers.copy()
+        isolated.cookies = copy.copy(self.cookies)
+        isolated.params = dict(self.params)
+        isolated.proxies = dict(self.proxies)
+        isolated.adapters = self.adapters.copy()
+        isolated.hooks = {name: list(hooks) for name, hooks in self.hooks.items()}
+        isolated.compliance_hook = {
+            name: set(hooks) for name, hooks in self.compliance_hook.items()
+        }
+        if "send" in self.__dict__:
+            isolated.send = self.__dict__["send"]
+        isolated._client = copy.copy(self._client)
+        isolated.token = {}
+        client = isolated._client
+        for attribute in ("access_token", "refresh_token", "mac_key"):
+            if hasattr(client, attribute):
+                setattr(client, attribute, None)
+        for attribute in ("expires_in", "expires_at", "_expires_at"):
+            if hasattr(client, attribute):
+                setattr(client, attribute, None)
+        isolated.state = self.state
+        isolated.auto_refresh_url = self.auto_refresh_url
+        isolated.auto_refresh_kwargs = dict(self.auto_refresh_kwargs)
+        isolated.token_updater = self.token_updater
+        isolated._state = transaction.state
+        isolated._code_verifier = transaction.code_verifier
+        isolated._pkce = transaction.pkce
+        isolated.redirect_uri = transaction.redirect_uri
+        isolated._scope = transaction.scope
+        return isolated
+
+    def _fetch_token_with_transaction(
+        self,
+        transaction,
+        token_url,
+        authorization_response,
+        code,
+        kwargs,
+        status_holder,
+    ):
+        """Run one exchange with a private client and private session state."""
+        isolated = self._clone_for_transaction(transaction)
+        client = isolated._client
+        client.client_id = transaction.client_id
+        client.code = code
+        client.token = {}
+        client.code_verifier = transaction.code_verifier
+        client.code_challenge = transaction.code_challenge
+        client.code_challenge_method = transaction.pkce
+
+        def capture_status(response):
+            status_holder["status_code"] = response.status_code
+            return response
+
+        isolated.register_compliance_hook(
+            "access_token_response", capture_status
+        )
+
+        if authorization_response is not None:
+            parsed = client.parse_request_uri_response(
+                authorization_response, state=transaction.state
+            )
+            code = parsed["code"]
+
+        if transaction.pkce and transaction.code_verifier is None:
+            raise ValueError(
+                "Code verifier is not found, authorization URL must be generated before"
+            )
+
+        return isolated.fetch_token(token_url, code=code, **dict(kwargs))
 
     def fetch_token(
         self,

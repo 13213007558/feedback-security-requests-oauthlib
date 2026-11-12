@@ -35,3 +35,24 @@ OAuth 2.0 Session
 
 .. autoclass:: OAuth2Session
     :members:
+
+.. autoclass:: AuthorizationTransaction
+    :members:
+
+.. autoclass:: AuthorizationTransactionError
+    :members:
+
+.. autoclass:: AuthorizationTransactionConsumedError
+    :members:
+
+.. autoclass:: AuthorizationTransactionInProgressError
+    :members:
+
+.. autoclass:: AuthorizationTransactionRedirectUriError
+    :members:
+
+.. autoclass:: AuthorizationTransactionClientMismatchError
+    :members:
+
+.. autoclass:: AuthorizationTransactionRetryableError
+    :members:

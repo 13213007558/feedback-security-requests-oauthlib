@@ -15,6 +15,28 @@ class TokenUpdated(Warning):
         self.token = token
 
 
+class TokenPersistenceError(Exception):
+    """Raised when a refreshed token could not be confirmed as persisted.
+
+    The authorization server may already have rotated the refresh token,
+    so neither the old nor the new credentials may be treated as a safe
+    implicit retry fallback until the new token is durably stored.
+
+    The refreshed token is available via the ``token`` attribute. It is
+    deliberately never included in the string representation so that
+    logging or reporting this error does not leak credentials.
+
+    :ivar token: The refreshed token awaiting persistence confirmation.
+    :ivar save_error: The original exception raised by the token updater,
+                      if any.
+    """
+
+    def __init__(self, message, token=None, save_error=None):
+        super(TokenPersistenceError, self).__init__(message)
+        self.token = token
+        self.save_error = save_error
+
+
 class OAuth2Session(requests.Session):
     """Versatile OAuth 2 extension to :class:`requests.Session`.
 
@@ -70,7 +92,11 @@ class OAuth2Session(requests.Session):
                         your token database on automatic token refresh. If not
                         set a TokenUpdated warning will be raised when a token
                         has been refreshed. This warning will carry the token
-                        in its token argument.
+                        in its token argument. If the updater raises an
+                        exception after a successful refresh, a
+                        TokenPersistenceError is raised and the session is
+                        blocked until the new token is confirmed persisted
+                        via :meth:`confirm_token_persisted`.
         :param pkce: Set "S256" or "plain" to enable PKCE. Default is disabled.
         :param kwargs: Arguments to pass to the Session constructor.
         """
@@ -85,6 +111,7 @@ class OAuth2Session(requests.Session):
         self.auto_refresh_kwargs = auto_refresh_kwargs or {}
         self.token_updater = token_updater
         self._pkce = pkce
+        self._pending_token = None
 
         if self._pkce not in ["S256", "plain", None]:
             raise AttributeError("Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce))
@@ -170,6 +197,70 @@ class OAuth2Session(requests.Session):
         will succeed.
         """
         return bool(self.access_token)
+
+    @property
+    def token_pending_persistence(self):
+        """The refreshed token that has not been confirmed as persisted.
+
+        This is set when an automatic refresh succeeded but the
+        ``token_updater`` callback failed. While it is not ``None`` the
+        session refuses to make token-bearing requests or further
+        refreshes, since the authorization server may already have
+        rotated the refresh token and the durable state is unknown.
+        """
+        return self._pending_token
+
+    def confirm_token_persisted(self):
+        """Confirm that the pending refreshed token is durably stored.
+
+        Call this after verifying your token storage holds the token
+        exposed via :attr:`token_pending_persistence`. Clears the
+        pending state so protected requests may proceed again.
+
+        :return: The confirmed token, or ``None`` if no token was pending.
+        """
+        token = self._pending_token
+        self._pending_token = None
+        return token
+
+    def retry_token_update(self):
+        """Re-invoke ``token_updater`` for the pending refreshed token.
+
+        Use this when the original update failed before committing, e.g.
+        the storage backend was temporarily unavailable. On success the
+        pending state is cleared.
+
+        :return: The confirmed token, or ``None`` if no token was pending.
+        :raises TokenPersistenceError: If no ``token_updater`` is
+                 configured or the updater fails again.
+        """
+        if self._pending_token is None:
+            return None
+        if not self.token_updater:
+            raise TokenPersistenceError(
+                "Cannot retry token persistence without a token_updater.",
+                token=self._pending_token,
+            )
+        try:
+            self.token_updater(self._pending_token)
+        except Exception as save_error:
+            log.error("Retry of token persistence failed: %s", save_error)
+            raise TokenPersistenceError(
+                "Refreshed token is still not confirmed as persisted.",
+                token=self._pending_token,
+                save_error=save_error,
+            ) from save_error
+        return self.confirm_token_persisted()
+
+    def _require_no_pending_token(self):
+        if self._pending_token is not None:
+            raise TokenPersistenceError(
+                "A refreshed token has not been confirmed as persisted; "
+                "verify your token storage and call "
+                "confirm_token_persisted() or retry_token_update() before "
+                "making further requests.",
+                token=self._pending_token,
+            )
 
     def authorization_url(self, url, state=None, **kwargs):
         """Form an authorization URL.
@@ -452,6 +543,12 @@ class OAuth2Session(requests.Session):
         if not is_secure_transport(token_url):
             raise InsecureTransportError()
 
+        # A previous refresh produced a token that was never confirmed as
+        # persisted. Refreshing again would spend credentials whose durable
+        # state is unknown, and the old (possibly rotated) refresh token
+        # must not be used as an implicit retry fallback.
+        self._require_no_pending_token()
+
         refresh_token = refresh_token or self.token.get("refresh_token")
 
         log.debug(
@@ -484,7 +581,7 @@ class OAuth2Session(requests.Session):
             proxies=proxies,
         )
         log.debug("Request to refresh token completed with status %s.", r.status_code)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
+        log.debug("Response headers were %s.", r.headers)
         log.debug(
             "Invoking %d token response hooks.",
             len(self.compliance_hook["refresh_token_response"]),
@@ -514,6 +611,10 @@ class OAuth2Session(requests.Session):
         """Intercept all requests and add the OAuth 2 token if present."""
         if not is_secure_transport(url):
             raise InsecureTransportError()
+        if self._pending_token is not None and not withhold_token:
+            # Refuse to silently use a session whose refreshed token has
+            # not been confirmed as persisted.
+            self._require_no_pending_token()
         if self.token and not withhold_token:
             log.debug(
                 "Invoking %d protected resource request hooks.",
@@ -523,7 +624,7 @@ class OAuth2Session(requests.Session):
                 log.debug("Invoking hook %s.", hook)
                 url, headers, data = hook(url, headers, data)
 
-            log.debug("Adding token %s to request.", self.token)
+            log.debug("Adding token to request.")
             try:
                 url, headers, data = self._client.add_token(
                     url, http_method=method, body=data, headers=headers
@@ -549,9 +650,28 @@ class OAuth2Session(requests.Session):
                     )
                     if self.token_updater:
                         log.debug(
-                            "Updating token to %s using %s.", token, self.token_updater
+                            "Saving refreshed token using %s.", self.token_updater
                         )
-                        self.token_updater(token)
+                        try:
+                            self.token_updater(token)
+                        except Exception as save_error:
+                            # The refresh already succeeded server-side and
+                            # the refresh token may have been rotated, so the
+                            # session is in an ambiguous state. Block further
+                            # use until the caller confirms persistence.
+                            self._pending_token = token
+                            log.error(
+                                "Refreshed token could not be persisted: %s",
+                                save_error,
+                            )
+                            raise TokenPersistenceError(
+                                "Token refresh succeeded but the new token "
+                                "could not be persisted; the session is "
+                                "blocked until confirm_token_persisted() or "
+                                "retry_token_update() succeeds.",
+                                token=token,
+                                save_error=save_error,
+                            ) from save_error
                         url, headers, data = self._client.add_token(
                             url, http_method=method, body=data, headers=headers
                         )

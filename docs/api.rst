@@ -29,6 +29,9 @@ OAuth 2.0
 .. autoclass:: TokenUpdated
     :members:
 
+.. autoclass:: TokenPersistenceError
+    :members:
+
 
 OAuth 2.0 Session
 -----------------

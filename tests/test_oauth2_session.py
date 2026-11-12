@@ -14,7 +14,7 @@ from oauthlib.oauth2 import TokenExpiredError, OAuth2Error
 from oauthlib.oauth2 import MismatchingStateError
 from oauthlib.oauth2 import WebApplicationClient, MobileApplicationClient
 from oauthlib.oauth2 import LegacyApplicationClient, BackendApplicationClient
-from requests_oauthlib import OAuth2Session, TokenUpdated
+from requests_oauthlib import OAuth2Session, TokenUpdated, TokenPersistenceError
 import requests
 
 from requests.auth import _basic_auth_str
@@ -552,3 +552,170 @@ class OAuth2SessionNetrcTest(OAuth2SessionTest):
         if self.prehome is not None:
             os.environ["HOME"] = self.prehome
         shutil.rmtree(self.homedir)
+
+
+class FakeTokenStorage:
+    """Fake durable token storage with injectable failure modes."""
+
+    def __init__(self):
+        self.saved = None
+        self.commit_calls = 0
+        self.fail_before_commit = False
+        self.fail_after_commit = False
+
+    def __call__(self, token):
+        self.commit_calls += 1
+        if self.fail_before_commit:
+            raise IOError("storage backend unavailable")
+        self.saved = dict(token)
+        if self.fail_after_commit:
+            raise IOError("lost response after commit")
+
+
+class FakeRefreshAdapter(requests.adapters.BaseAdapter):
+    """Serves a rotated token on refresh and 200 on protected resources."""
+
+    def __init__(self, refreshed_token):
+        super(FakeRefreshAdapter, self).__init__()
+        self.refreshed_token = refreshed_token
+        self.refresh_requests = 0
+        self.protected_requests = 0
+
+    def send(self, request, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.url = request.url
+        resp.request = request
+        resp.headers["Content-Type"] = "application/json"
+        if "/refresh" in request.url:
+            self.refresh_requests += 1
+            resp._content = json.dumps(self.refreshed_token).encode("utf-8")
+        else:
+            self.protected_requests += 1
+            resp._content = b"{}"
+        return resp
+
+    def close(self):
+        pass
+
+
+@mock.patch("time.time", new=lambda: fake_time)
+class TokenPersistenceTest(TestCase):
+    """Verify the explicit refresh-update result and recovery interface."""
+
+    def setUp(self):
+        self.expired_token = {
+            "token_type": "Bearer",
+            "access_token": "asdfoiw37850234lkjsdfsdf",
+            "refresh_token": "sldvafkjw34509s8dfsdf",
+            "expires_in": "-1",
+        }
+        self.refreshed_token = {
+            "token_type": "Bearer",
+            "access_token": "rotatedaccesstoken",
+            "refresh_token": "rotatedrefreshtoken",
+            "expires_in": 3600,
+        }
+        # oauthlib adds expires_at when parsing the token response
+        self.expected_token = dict(self.refreshed_token)
+        self.expected_token["expires_at"] = round(fake_time) + 3600
+        self.storage = FakeTokenStorage()
+        self.adapter = FakeRefreshAdapter(self.refreshed_token)
+        self.session = OAuth2Session(
+            client_id="someclientid",
+            token=self.expired_token,
+            auto_refresh_url="https://i.b/refresh",
+            token_updater=self.storage,
+        )
+        self.session.mount("https://", self.adapter)
+
+    def test_pre_commit_failure_blocks_session_until_retry(self):
+        self.storage.fail_before_commit = True
+
+        with self.assertRaises(TokenPersistenceError) as ctx:
+            self.session.get("https://i.b")
+
+        # The update result explicitly exposes the unconfirmed token and
+        # the original failure, without persisting anything.
+        self.assertEqual(ctx.exception.token, self.expected_token)
+        self.assertIsInstance(ctx.exception.save_error, IOError)
+        self.assertIsNone(self.storage.saved)
+        self.assertEqual(self.session.token_pending_persistence, self.expected_token)
+
+        # Ordinary requests must not silently use the ambiguous session,
+        # and the old (rotated) refresh token is not a retry fallback.
+        self.assertRaises(TokenPersistenceError, self.session.get, "https://i.b")
+        self.assertRaises(
+            TokenPersistenceError,
+            self.session.refresh_token,
+            "https://i.b/refresh",
+        )
+        self.assertEqual(self.adapter.refresh_requests, 1)
+        self.assertEqual(self.adapter.protected_requests, 0)
+
+        # Recovery: the storage backend is back, retry the pending update.
+        self.storage.fail_before_commit = False
+        confirmed = self.session.retry_token_update()
+        self.assertEqual(confirmed, self.expected_token)
+        self.assertEqual(self.storage.saved, self.expected_token)
+        self.assertIsNone(self.session.token_pending_persistence)
+
+        self.session.get("https://i.b")
+        self.assertEqual(self.adapter.protected_requests, 1)
+
+    def test_post_commit_response_lost_recovery_confirmation(self):
+        self.storage.fail_after_commit = True
+
+        with self.assertRaises(TokenPersistenceError) as ctx:
+            self.session.get("https://i.b")
+
+        # The token was committed before the response was lost; the caller
+        # can verify storage and confirm instead of re-saving.
+        self.assertEqual(self.storage.saved, self.expected_token)
+        self.assertEqual(self.session.token_pending_persistence, self.expected_token)
+        self.assertRaises(TokenPersistenceError, self.session.get, "https://i.b")
+
+        confirmed = self.session.confirm_token_persisted()
+        self.assertEqual(confirmed, self.expected_token)
+        self.assertIsNone(self.session.token_pending_persistence)
+        self.assertEqual(self.storage.commit_calls, 1)
+
+        self.session.get("https://i.b")
+        self.assertEqual(self.adapter.protected_requests, 1)
+
+    def test_retry_token_update_failure_keeps_pending_state(self):
+        self.storage.fail_before_commit = True
+        self.assertRaises(TokenPersistenceError, self.session.get, "https://i.b")
+
+        with self.assertRaises(TokenPersistenceError) as ctx:
+            self.session.retry_token_update()
+        self.assertIsInstance(ctx.exception.save_error, IOError)
+        self.assertEqual(self.session.token_pending_persistence, self.expected_token)
+
+    def test_error_and_logs_do_not_leak_new_token(self):
+        self.storage.fail_before_commit = True
+
+        logger = "requests_oauthlib.oauth2_session"
+        with self.assertLogs(logger, level="DEBUG") as logs:
+            with self.assertRaises(TokenPersistenceError) as ctx:
+                self.session.get("https://i.b")
+
+        secret_values = (
+            self.refreshed_token["access_token"],
+            self.refreshed_token["refresh_token"],
+        )
+        for rendered in (str(ctx.exception), repr(ctx.exception)):
+            for secret in secret_values:
+                self.assertNotIn(secret, rendered)
+        for record in logs.output:
+            for secret in secret_values:
+                self.assertNotIn(secret, record)
+
+        # The token remains reachable for the caller via the result
+        # interface, just never through messages or logs.
+        self.assertEqual(ctx.exception.token, self.expected_token)
+
+    def test_confirm_without_pending_token_is_noop(self):
+        self.assertIsNone(self.session.token_pending_persistence)
+        self.assertIsNone(self.session.confirm_token_persisted())
+        self.assertIsNone(self.session.retry_token_update())

@@ -4,7 +4,7 @@ import logging
 from .oauth1_auth import OAuth1
 from .oauth1_session import OAuth1Session
 from .oauth2_auth import OAuth2
-from .oauth2_session import OAuth2Session, TokenUpdated
+from .oauth2_session import OAuth2Session, TokenUpdated, TokenPersistenceError
 
 __version__ = "2.0.0"
 

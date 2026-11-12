@@ -288,6 +288,31 @@ however that you still need to update ``expires_in`` to trigger the refresh.
     ...     auto_refresh_kwargs=extra, token_updater=token_saver)
     >>> r = oauth.get(protected_url)
 
+If the ``token_updater`` raises after the refresh itself succeeded, a
+``TokenPersistenceError`` is raised and the session stops serving
+token-bearing requests, because the authorization server may already have
+rotated the refresh token and the durable state is unknown. The refreshed
+token is available via ``oauth.token_pending_persistence`` (and on the
+exception's ``token`` attribute; it is never included in the error message
+or logs). After making sure your storage holds the new token, confirm it to
+unblock the session:
+
+.. code-block:: pycon
+
+    >>> from requests_oauthlib import OAuth2Session, TokenPersistenceError
+    >>> try:
+    ...     r = oauth.get(protected_url)
+    ... except TokenPersistenceError:
+    ...     if token_storage_holds(oauth.token_pending_persistence):
+    ...         oauth.confirm_token_persisted()
+    ...     else:
+    ...         oauth.retry_token_update()  # re-invoke token_updater
+    ...     r = oauth.get(protected_url)
+
+Note that while a token is pending persistence confirmation, the session
+refuses further refreshes as well: the old refresh token must not be used
+as an implicit retry fallback since it may already be invalid.
+
 TLS Client Authentication
 -------------------------
 

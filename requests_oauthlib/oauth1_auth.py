@@ -7,6 +7,8 @@ from oauthlib.oauth1 import SIGNATURE_TYPE_BODY
 from requests.utils import to_native_string
 from requests.auth import AuthBase
 
+from ._sanitizers import redact_headers, sanitize_url
+
 CONTENT_TYPE_FORM_URLENCODED = "application/x-www-form-urlencoded"
 CONTENT_TYPE_MULTI_PART = "multipart/form-data"
 
@@ -69,7 +71,7 @@ class OAuth1(AuthBase):
         """
         # Overwriting url is safe here as request will not modify it past
         # this point.
-        log.debug("Signing request %s using client %s", r, self.client)
+        log.debug("Signing request %s using client %s", r, self.client.client_key)
 
         content_type = r.headers.get("Content-Type", "")
         if (
@@ -106,7 +108,7 @@ class OAuth1(AuthBase):
 
         r.prepare_headers(headers)
         r.url = to_native_string(r.url)
-        log.debug("Updated url: %s", r.url)
-        log.debug("Updated headers: %s", headers)
-        log.debug("Updated body: %r", r.body)
+        log.debug("Updated url: %s", sanitize_url(r.url))
+        log.debug("Updated headers: %s", redact_headers(headers))
+        log.debug("Updated body length: %d", len(r.body or ""))
         return r

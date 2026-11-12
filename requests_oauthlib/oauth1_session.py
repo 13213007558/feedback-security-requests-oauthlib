@@ -8,6 +8,7 @@ from oauthlib.oauth1 import SIGNATURE_HMAC, SIGNATURE_RSA, SIGNATURE_TYPE_AUTH_H
 import requests
 
 from . import OAuth1
+from ._sanitizers import sanitize_url
 
 
 log = logging.getLogger(__name__)
@@ -249,7 +250,7 @@ class OAuth1Session(requests.Session):
         'https://api.twitter.com/oauth/authorize?oauth_token=sdf0o9823sjdfsdf&oauth_callback=https%3A%2F%2F127.0.0.1%2Fcallback'
         """
         kwargs["oauth_token"] = request_token or self._client.client.resource_owner_key
-        log.debug("Adding parameters %s to url %s", kwargs, url)
+        log.debug("Adding parameters %s to url %s", sorted(kwargs), url)
         return add_params_to_uri(url, kwargs.items())
 
     def fetch_request_token(self, url, realm=None, **request_kwargs):
@@ -336,7 +337,7 @@ class OAuth1Session(requests.Session):
             'oauth_verifier: 'w34o8967345',
         }
         """
-        log.debug("Parsing token from query part of url %s", url)
+        log.debug("Parsing token from query part of url %s", sanitize_url(url))
         token = dict(urldecode(urlparse(url).query))
         log.debug("Updating internal client token attribute.")
         self._populate_attributes(token)
@@ -348,7 +349,10 @@ class OAuth1Session(requests.Session):
             self._client.client.resource_owner_key = token["oauth_token"]
         else:
             raise TokenMissing(
-                "Response does not contain a token: {resp}".format(resp=token), token
+                "Response does not contain a token, got parameters: {keys}".format(
+                    keys=sorted(token)
+                ),
+                token,
             )
         if "oauth_token_secret" in token:
             self._client.client.resource_owner_secret = token["oauth_token_secret"]
@@ -356,27 +360,31 @@ class OAuth1Session(requests.Session):
             self._client.client.verifier = token["oauth_verifier"]
 
     def _fetch_token(self, url, **request_kwargs):
-        log.debug("Fetching token from %s using client %s", url, self._client.client)
+        log.debug(
+            "Fetching token from %s using client %s",
+            url,
+            self._client.client.client_key,
+        )
         r = self.post(url, **request_kwargs)
 
         if r.status_code >= 400:
-            error = "Token request failed with code %s, response was '%s'."
-            raise TokenRequestDenied(error % (r.status_code, r.text), r)
+            error = "Token request failed with code %s."
+            raise TokenRequestDenied(error % r.status_code, r)
 
-        log.debug('Decoding token from response "%s"', r.text)
+        log.debug("Decoding token from response with status %s.", r.status_code)
         try:
             token = dict(urldecode(r.text.strip()))
-        except ValueError as e:
+        except ValueError:
+            # The decoding error echoes the raw response body, which may
+            # contain credentials. Do not propagate it to the caller.
             error = (
                 "Unable to decode token from token response. "
                 "This is commonly caused by an unsuccessful request where"
-                " a non urlencoded error message is returned. "
-                "The decoding error was %s"
-                "" % e
+                " a non urlencoded error message is returned."
             )
             raise ValueError(error)
 
-        log.debug("Obtained token %s", token)
+        log.debug("Obtained token %s", sorted(token))
         log.debug("Updating internal client attributes from token data.")
         self._populate_attributes(token)
         self.token = token

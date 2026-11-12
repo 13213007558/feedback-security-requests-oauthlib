@@ -6,6 +6,8 @@ from oauthlib.oauth2 import LegacyApplicationClient
 from oauthlib.oauth2 import TokenExpiredError, is_secure_transport
 import requests
 
+from ._sanitizers import redact_headers, redact_request_kwargs, sanitize_url
+
 log = logging.getLogger(__name__)
 
 
@@ -391,10 +393,9 @@ class OAuth2Session(requests.Session):
         )
 
         log.debug("Request to fetch token completed with status %s.", r.status_code)
-        log.debug("Request url was %s", r.request.url)
-        log.debug("Request headers were %s", r.request.headers)
-        log.debug("Request body was %s", r.request.body)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
+        log.debug("Request url was %s", sanitize_url(r.request.url))
+        log.debug("Request headers were %s", redact_headers(r.request.headers))
+        log.debug("Response headers were %s.", r.headers)
         log.debug(
             "Invoking %d token response hooks.",
             len(self.compliance_hook["access_token_response"]),
@@ -405,7 +406,7 @@ class OAuth2Session(requests.Session):
 
         self._client.parse_request_body_response(r.text, scope=self.scope)
         self.token = self._client.token
-        log.debug("Obtained token %s.", self.token)
+        log.debug("Obtained token with parameters %s.", sorted(self.token))
         return self.token
 
     def token_from_fragment(self, authorization_response):
@@ -455,13 +456,17 @@ class OAuth2Session(requests.Session):
         refresh_token = refresh_token or self.token.get("refresh_token")
 
         log.debug(
-            "Adding auto refresh key word arguments %s.", self.auto_refresh_kwargs
+            "Adding auto refresh key word arguments %s.",
+            sorted(self.auto_refresh_kwargs),
         )
         kwargs.update(self.auto_refresh_kwargs)
         body = self._client.prepare_refresh_body(
             body=body, refresh_token=refresh_token, scope=self.scope, **kwargs
         )
-        log.debug("Prepared refresh token request body %s", body)
+        log.debug(
+            "Prepared refresh token request body with parameters %s",
+            sorted(dict(urldecode(body))),
+        )
 
         if headers is None:
             headers = {
@@ -484,7 +489,7 @@ class OAuth2Session(requests.Session):
             proxies=proxies,
         )
         log.debug("Request to refresh token completed with status %s.", r.status_code)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
+        log.debug("Response headers were %s.", r.headers)
         log.debug(
             "Invoking %d token response hooks.",
             len(self.compliance_hook["refresh_token_response"]),
@@ -523,7 +528,7 @@ class OAuth2Session(requests.Session):
                 log.debug("Invoking hook %s.", hook)
                 url, headers, data = hook(url, headers, data)
 
-            log.debug("Adding token %s to request.", self.token)
+            log.debug("Adding token %s to request.", sorted(self.token))
             try:
                 url, headers, data = self._client.add_token(
                     url, http_method=method, body=data, headers=headers
@@ -548,9 +553,7 @@ class OAuth2Session(requests.Session):
                         self.auto_refresh_url, auth=auth, **kwargs
                     )
                     if self.token_updater:
-                        log.debug(
-                            "Updating token to %s using %s.", token, self.token_updater
-                        )
+                        log.debug("Updating token using %s.", self.token_updater)
                         self.token_updater(token)
                         url, headers, data = self._client.add_token(
                             url, http_method=method, body=data, headers=headers
@@ -560,9 +563,9 @@ class OAuth2Session(requests.Session):
                 else:
                     raise
 
-        log.debug("Requesting url %s using method %s.", url, method)
-        log.debug("Supplying headers %s and data %s", headers, data)
-        log.debug("Passing through key word arguments %s.", kwargs)
+        log.debug("Requesting url %s using method %s.", sanitize_url(url), method)
+        log.debug("Supplying headers %s.", redact_headers(headers))
+        log.debug("Passing through key word arguments %s.", redact_request_kwargs(kwargs))
         return super(OAuth2Session, self).request(
             method, url, headers=headers, data=data, files=files, **kwargs
         )

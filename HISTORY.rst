@@ -1,6 +1,17 @@
 History
 -------
 
+UNRELEASED
+++++++++++
+
+- Debug logs and exception messages no longer contain access tokens, refresh
+  tokens or client secrets. Request/response bodies, token payloads,
+  ``Authorization`` headers and URL query strings are now redacted or omitted
+  from ``requests_oauthlib`` log output, while phase, status code and target
+  endpoint information is preserved. ``TokenRequestDenied`` no longer embeds
+  the raw response body in its message; the response remains available on the
+  exception's ``response`` attribute.
+
 v2.0.0 (22 March 2024)
 ++++++++++++++++++++++++
 

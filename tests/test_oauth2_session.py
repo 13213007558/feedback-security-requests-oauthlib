@@ -552,3 +552,227 @@ class OAuth2SessionNetrcTest(OAuth2SessionTest):
         if self.prehome is not None:
             os.environ["HOME"] = self.prehome
         shutil.rmtree(self.homedir)
+
+
+class RecordingAdapter(requests.adapters.HTTPAdapter):
+    """Records every PreparedRequest and the transport kwargs used to send it.
+
+    Allows assertions on the exact endpoint, headers, body and transport
+    configuration (cert/verify/proxies) reached by each request, without any
+    real network activity.
+    """
+
+    def __init__(self, token):
+        super(RecordingAdapter, self).__init__()
+        self.token = token
+        self.calls = []
+
+    def send(self, request, stream=False, timeout=None, verify=True,
+             cert=None, proxies=None):
+        self.calls.append({
+            "request": request,
+            "url": request.url,
+            "headers": dict(request.headers),
+            "body": request.body,
+            "stream": stream,
+            "timeout": timeout,
+            "verify": verify,
+            "cert": cert,
+            "proxies": proxies,
+        })
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(self.token).encode("utf-8")
+        response.headers["Content-Type"] = "application/json"
+        response.raw = None
+        response.request = request
+        return response
+
+
+class AutoRefreshAuthIsolationTest(TestCase):
+    """Resource server auth, client auth and transport config must not mix.
+
+    These tests trace a business request that triggers an automatic
+    ``refresh_token`` call end to end and verify which parameters reach the
+    token endpoint and which are kept on the resource server request.
+    """
+
+    refresh_url = "https://idp.example.com/token"
+    resource_url = "https://rs.example.com/data"
+
+    def setUp(self):
+        self.expired_token = {
+            "token_type": "Bearer",
+            "access_token": "expired-access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": -1,
+        }
+        self.new_token = {
+            "token_type": "Bearer",
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+        }
+
+    def make_session(self, **kwargs):
+        session = OAuth2Session(
+            token=dict(self.expired_token),
+            auto_refresh_url=self.refresh_url,
+            token_updater=lambda token: None,
+            **kwargs
+        )
+        adapter = RecordingAdapter(self.new_token)
+        session.mount("https://", adapter)
+        return session, adapter
+
+    def test_refresh_request_only_carries_grant_and_refresh_token(self):
+        session, adapter = self.make_session()
+        session.get(self.resource_url)
+
+        self.assertEqual(len(adapter.calls), 2)
+        refresh_call, resource_call = adapter.calls
+        self.assertEqual(refresh_call["url"], self.refresh_url)
+        self.assertEqual(
+            refresh_call["body"],
+            "grant_type=refresh_token&refresh_token=refresh-token",
+        )
+        self.assertNotIn("Authorization", refresh_call["headers"])
+
+    def test_resource_request_auth_is_not_forwarded_to_token_endpoint(self):
+        session, adapter = self.make_session()
+        resource_auth = requests.auth.HTTPBasicAuth(
+            "resource-user", "resource-password"
+        )
+        with self.assertRaises(ValueError):
+            session.get(self.resource_url, auth=resource_auth)
+        self.assertEqual(adapter.calls, [])
+
+    def test_client_credentials_authenticate_only_the_token_endpoint(self):
+        session, adapter = self.make_session()
+        session.get(
+            self.resource_url,
+            client_id="someclientid",
+            client_secret="someclientsecret",
+        )
+
+        refresh_call, resource_call = adapter.calls
+        expected_basic = "Basic " + b64encode(
+            b"someclientid:someclientsecret"
+        ).decode("latin1")
+        self.assertEqual(
+            refresh_call["headers"].get("Authorization"), expected_basic
+        )
+        self.assertEqual(
+            resource_call["headers"].get("Authorization"),
+            "Bearer new-access-token",
+        )
+
+    def test_explicit_refresh_token_auth_still_supported(self):
+        session = OAuth2Session(token=dict(self.expired_token))
+        adapter = RecordingAdapter(self.new_token)
+        session.mount("https://", adapter)
+
+        session.refresh_token(
+            self.refresh_url,
+            auth=requests.auth.HTTPBasicAuth("someclientid", "someclientsecret"),
+        )
+        refresh_call = adapter.calls[0]
+        self.assertEqual(
+            refresh_call["headers"].get("Authorization"),
+            "Basic " + b64encode(b"someclientid:someclientsecret").decode("latin1"),
+        )
+        self.assertEqual(
+            refresh_call["body"],
+            "grant_type=refresh_token&refresh_token=refresh-token",
+        )
+
+    def test_cert_is_used_at_tls_layer_and_never_encoded_in_body(self):
+        cert = ("/fake/cert.pem", "/fake/key.pem")
+        session, adapter = self.make_session()
+        session.get(self.resource_url, cert=cert)
+
+        refresh_call, resource_call = adapter.calls
+        self.assertEqual(refresh_call["cert"], cert)
+        self.assertEqual(resource_call["cert"], cert)
+        self.assertNotIn("cert", refresh_call["body"])
+
+    def test_explicit_refresh_token_cert_uses_tls_layer(self):
+        session = OAuth2Session(token=dict(self.expired_token))
+        adapter = RecordingAdapter(self.new_token)
+        session.mount("https://", adapter)
+
+        session.refresh_token(self.refresh_url, cert="/fake/mtls.pem")
+        self.assertEqual(adapter.calls[0]["cert"], "/fake/mtls.pem")
+        self.assertNotIn("cert", adapter.calls[0]["body"])
+
+    def test_transport_kwargs_are_forwarded_but_kept_out_of_the_body(self):
+        proxies = {"https": "http://proxy.example:8080"}
+        session, adapter = self.make_session()
+        session.get(
+            self.resource_url,
+            proxies=proxies,
+            verify=False,
+            timeout=7,
+            json={"question": "answer"},
+            stream=True,
+        )
+
+        refresh_call, resource_call = adapter.calls
+        self.assertEqual(refresh_call["proxies"], proxies)
+        self.assertFalse(refresh_call["verify"])
+        self.assertEqual(refresh_call["timeout"], 7)
+        self.assertEqual(
+            refresh_call["body"],
+            "grant_type=refresh_token&refresh_token=refresh-token",
+        )
+        # business request parameters stay on the business request
+        self.assertEqual(resource_call["proxies"], proxies)
+        self.assertFalse(resource_call["verify"])
+        self.assertTrue(resource_call["stream"])
+        self.assertEqual(json.loads(resource_call["body"]), {"question": "answer"})
+
+    def test_session_auth_opt_in_applies_to_both_endpoints(self):
+        session, adapter = self.make_session()
+        session.auth = requests.auth.HTTPBasicAuth("session-user", "session-pass")
+        session.get(self.resource_url)
+
+        refresh_call, resource_call = adapter.calls
+        self.assertTrue(
+            refresh_call["headers"].get("Authorization", "").startswith("Basic ")
+        )
+        self.assertTrue(
+            resource_call["headers"].get("Authorization", "").startswith("Basic ")
+        )
+
+    def test_refreshed_business_request_uses_the_new_bearer_token(self):
+        session, adapter = self.make_session()
+        response = session.get(
+            self.resource_url, headers={"X-Trace": "keep-this-header"}
+        )
+
+        refresh_call, resource_call = adapter.calls
+        self.assertEqual(resource_call["url"], self.resource_url)
+        self.assertEqual(
+            resource_call["headers"]["Authorization"], "Bearer new-access-token"
+        )
+        self.assertEqual(resource_call["headers"]["X-Trace"], "keep-this-header")
+        self.assertEqual(session.access_token, "new-access-token")
+        self.assertEqual(response.request.headers["Authorization"],
+                         "Bearer new-access-token")
+
+    def test_auto_refresh_kwargs_reject_transport_keys(self):
+        for reserved in ("auth", "cert", "proxies", "verify", "timeout", "headers"):
+            with self.assertRaises(ValueError):
+                OAuth2Session(
+                    token=dict(self.expired_token),
+                    auto_refresh_url=self.refresh_url,
+                    auto_refresh_kwargs={reserved: "value"},
+                )
+
+    def test_auto_refresh_kwargs_accept_body_parameters(self):
+        session, adapter = self.make_session(
+            auto_refresh_kwargs={"client_id": "someclientid"}
+        )
+        session.get(self.resource_url)
+        self.assertIn("client_id=someclientid", adapter.calls[0]["body"])
+

@@ -288,6 +288,43 @@ however that you still need to update ``expires_in`` to trigger the refresh.
     ...     auto_refresh_kwargs=extra, token_updater=token_saver)
     >>> r = oauth.get(protected_url)
 
+Keeping resource server, client and transport credentials separate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An automatic refresh involves two different servers, and credentials are kept
+separate so that they are never sent to the wrong endpoint:
+
+- The **Bearer token** is only attached to protected resource requests. The
+  refresh request to the token endpoint is always sent with
+  ``withhold_token=True`` and never carries the access token.
+- **Client authentication** for the token endpoint is provided with the
+  ``client_id`` / ``client_secret`` arguments of the business request (encoded
+  as HTTP Basic auth for the refresh request), via ``session.auth``, or by
+  calling :meth:`~requests_oauthlib.OAuth2Session.refresh_token` with an
+  explicit ``auth`` argument.
+- The ``auth`` argument of a protected resource request authenticates against
+  the **resource server** only. Passing it on a request whose token is expired
+  raises a ``ValueError`` instead of silently replaying those credentials
+  against the token endpoint. Authenticate the refresh explicitly instead:
+
+.. code-block:: pycon
+
+    >>> # resource server credentials stay on the resource server request
+    >>> oauth.get(protected_url, auth=('resource-user', 'resource-pass'))
+    >>> # client credentials authenticate the automatic refresh request
+    >>> oauth.get(protected_url, client_id=client_id,
+    ...           client_secret=client_secret)
+
+Transport configuration (``proxies``, ``verify``, ``timeout`` and ``cert``)
+supplied to the business request is forwarded at the transport layer to the
+refresh request as well, but it is never encoded into the token request body.
+Other business request keyword arguments (for example ``json``, ``stream`` or
+``hooks``) are not forwarded. Because ``auto_refresh_kwargs`` are merged into
+the token request *body*, transport keys are rejected there with a
+``ValueError``; put token body parameters such as ``client_id`` in
+``auto_refresh_kwargs`` and configure transport on the session or on each
+request.
+
 TLS Client Authentication
 -------------------------
 
@@ -299,5 +336,17 @@ token request and ensure that the client id is sent in the request:
 
    >>> oauth.fetch_token(token_url='https://somesite.com/oauth2/token',
    ...     include_client_id=True, cert=('test-client.pem', 'test-client-key.pem'))
+
+The same certificate is used at the TLS layer when refreshing a token. Pass it
+to the business request (it is forwarded to the automatic refresh request) or
+to ``refresh_token`` directly; it is never placed in the request body:
+
+.. code-block:: pycon
+
+   >>> # automatic refresh triggered by an expired token
+   >>> oauth.get(protected_url, cert=('test-client.pem', 'test-client-key.pem'))
+   >>> # or an explicit refresh
+   >>> oauth.refresh_token(refresh_url, cert=('test-client.pem',
+   ...                                        'test-client-key.pem'))
 
 .. _write this section: https://github.com/requests/requests-oauthlib/issues/48

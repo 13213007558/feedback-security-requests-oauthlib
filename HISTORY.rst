@@ -1,6 +1,26 @@
 History
 -------
 
+Unreleased
+++++++++++
+
+- During automatic token refresh, only transport level keyword arguments
+  (``timeout``, ``verify``, ``proxies`` and ``cert``) are forwarded to the
+  token endpoint. Other business request keyword arguments (e.g. ``json``,
+  ``stream``, ``hooks``) are no longer encoded into the refresh token request
+  body.
+- The ``auth`` argument of a protected resource request is no longer forwarded
+  to the token endpoint during automatic refresh; doing so now raises a
+  ``ValueError``. Use ``client_id``/``client_secret``, ``session.auth`` or an
+  explicit ``refresh_token(auth=...)`` for client authentication.
+- ``refresh_token`` now accepts a ``cert`` argument that is used at the TLS
+  layer instead of being serialized into the request body, matching
+  ``fetch_token``.
+- ``OAuth2Session`` raises a ``ValueError`` when transport level keys
+  (``auth``, ``cert``, ``proxies``, ``verify``, ``timeout``, ``headers``) are
+  placed in ``auto_refresh_kwargs``, which only accepts token request body
+  parameters.
+
 v2.0.0 (22 March 2024)
 ++++++++++++++++++++++++
 

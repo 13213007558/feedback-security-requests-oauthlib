@@ -8,6 +8,14 @@ import requests
 
 log = logging.getLogger(__name__)
 
+# Transport level keyword arguments accepted by `requests` that must never be
+# encoded into a token endpoint request body. They are forwarded as request
+# configuration instead (see the explicit parameters of `refresh_token` and
+# the whitelist in `OAuth2Session.request`).
+_TRANSPORT_KWARGS = frozenset(
+    ["timeout", "headers", "verify", "proxies", "cert", "auth"]
+)
+
 
 class TokenUpdated(Warning):
     def __init__(self, token):
@@ -85,6 +93,22 @@ class OAuth2Session(requests.Session):
         self.auto_refresh_kwargs = auto_refresh_kwargs or {}
         self.token_updater = token_updater
         self._pkce = pkce
+
+        # auto_refresh_kwargs are merged into the refresh token request *body*
+        # by oauthlib. Reject transport level keys here so that credentials and
+        # configuration such as proxy URLs do not silently leak to the
+        # authorization server as form fields.
+        misplaced = sorted(set(self.auto_refresh_kwargs) & _TRANSPORT_KWARGS)
+        if misplaced:
+            raise ValueError(
+                "auto_refresh_kwargs must only contain token request body "
+                "parameters; transport arguments {misplaced} are not allowed. "
+                "Configure transport arguments on the session or pass them to "
+                "refresh_token() explicitly (client authentication belongs in "
+                "the `auth` parameter, TLS certificates in `cert`).".format(
+                    misplaced=", ".join(misplaced)
+                )
+            )
 
         if self._pkce not in ["S256", "plain", None]:
             raise AttributeError("Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce))
@@ -430,6 +454,7 @@ class OAuth2Session(requests.Session):
         headers=None,
         verify=None,
         proxies=None,
+        cert=None,
         **kwargs
     ):
         """Fetch a new access token using a refresh token.
@@ -443,6 +468,11 @@ class OAuth2Session(requests.Session):
         :param headers: A dict of headers to be used by `requests`.
         :param verify: Verify SSL certificate.
         :param proxies: The `proxies` argument will be passed to `requests`.
+        :param cert: Client certificate to send for OAuth 2.0 Mutual-TLS Client
+                     Authentication (draft-ietf-oauth-mtls). Can either be the
+                     path of a file containing the private key and certificate
+                     or a tuple of two filenames for certificate and key. It is
+                     used at the TLS layer and is never sent in the request body.
         :param kwargs: Extra parameters to include in the token request.
         :return: A token dict
         """
@@ -482,6 +512,7 @@ class OAuth2Session(requests.Session):
             verify=verify,
             withhold_token=True,
             proxies=proxies,
+            cert=cert,
         )
         log.debug("Request to refresh token completed with status %s.", r.status_code)
         log.debug("Response headers were %s and content %s.", r.headers, r.text)
@@ -536,16 +567,42 @@ class OAuth2Session(requests.Session):
                         self.auto_refresh_url,
                     )
 
-                    # We mustn't pass auth twice.
+                    # Resource server credentials attached to the business
+                    # request must never be silently replayed against the
+                    # authorization server. Client authentication for the
+                    # refresh request is configured explicitly via
+                    # client_id/client_secret below, session.auth, or an
+                    # explicit call to refresh_token(auth=...).
                     auth = kwargs.pop("auth", None)
-                    if client_id and client_secret and (auth is None):
+                    if auth is not None:
+                        raise ValueError(
+                            "The `auth` argument of a protected resource "
+                            "request authenticates against the resource server "
+                            "and cannot be forwarded to the token endpoint "
+                            "during automatic token refresh. Pass client "
+                            "authentication via the `client_id` and "
+                            "`client_secret` arguments, configure `session.auth`, "
+                            "or call refresh_token(auth=...) explicitly."
+                        )
+                    if client_id and client_secret:
                         log.debug(
-                            'Encoding client_id "%s" with client_secret as Basic auth credentials.',
+                            'Encoding client_id "%s" with client_secret as '
+                            "Basic auth credentials.",
                             client_id,
                         )
                         auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+
+                    # Only transport level keyword arguments are forwarded to
+                    # the refresh request. Everything else (e.g. `json`,
+                    # `stream`, `hooks`) belongs to the business request and
+                    # must not be encoded into the token endpoint form body.
+                    refresh_kwargs = {
+                        key: kwargs[key]
+                        for key in ("timeout", "verify", "proxies", "cert")
+                        if key in kwargs
+                    }
                     token = self.refresh_token(
-                        self.auto_refresh_url, auth=auth, **kwargs
+                        self.auto_refresh_url, auth=auth, **refresh_kwargs
                     )
                     if self.token_updater:
                         log.debug(

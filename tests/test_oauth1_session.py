@@ -6,6 +6,11 @@ from unittest import mock
 from oauthlib.oauth1 import SIGNATURE_TYPE_QUERY, SIGNATURE_TYPE_BODY
 from oauthlib.oauth1 import SIGNATURE_RSA, SIGNATURE_PLAINTEXT
 from requests_oauthlib import OAuth1Session
+from requests_oauthlib.oauth1_session import (
+    TokenMissing,
+    TokenRequestDenied,
+    VerifierMissing,
+)
 
 try:
     import cryptography
@@ -159,16 +164,17 @@ class OAuth1SessionTest(unittest.TestCase):
 
     def test_fetch_request_token(self):
         auth = OAuth1Session("foo")
-        auth.send = self.fake_body("oauth_token=foo")
+        auth.send = self.fake_body("oauth_token=foo&oauth_token_secret=bar")
         resp = auth.fetch_request_token("https://example.com/token")
         self.assertEqual(resp["oauth_token"], "foo")
+        self.assertEqual(resp["oauth_token_secret"], "bar")
         for k, v in resp.items():
             self.assertIsInstance(k, str)
             self.assertIsInstance(v, str)
 
     def test_fetch_request_token_with_optional_arguments(self):
         auth = OAuth1Session("foo")
-        auth.send = self.fake_body("oauth_token=foo")
+        auth.send = self.fake_body("oauth_token=foo&oauth_token_secret=bar")
         resp = auth.fetch_request_token(
             "https://example.com/token", verify=False, stream=True
         )
@@ -179,16 +185,17 @@ class OAuth1SessionTest(unittest.TestCase):
 
     def test_fetch_access_token(self):
         auth = OAuth1Session("foo", verifier="bar")
-        auth.send = self.fake_body("oauth_token=foo")
+        auth.send = self.fake_body("oauth_token=foo&oauth_token_secret=bar")
         resp = auth.fetch_access_token("https://example.com/token")
         self.assertEqual(resp["oauth_token"], "foo")
+        self.assertEqual(resp["oauth_token_secret"], "bar")
         for k, v in resp.items():
             self.assertIsInstance(k, str)
             self.assertIsInstance(v, str)
 
     def test_fetch_access_token_with_optional_arguments(self):
         auth = OAuth1Session("foo", verifier="bar")
-        auth.send = self.fake_body("oauth_token=foo")
+        auth.send = self.fake_body("oauth_token=foo&oauth_token_secret=bar")
         resp = auth.fetch_access_token(
             "https://example.com/token", verify=False, stream=True
         )
@@ -227,6 +234,172 @@ class OAuth1SessionTest(unittest.TestCase):
         auth = OAuth1Session("foo")
         del auth._client.client.verifier
         self._test_fetch_access_token_raises_error(auth)
+
+    def _mid_handshake_session(self):
+        """A session with a complete temporary (request token) state."""
+        return OAuth1Session(
+            "fake-client-key",
+            client_secret="fake-client-secret",
+            resource_owner_key="fake-request-token",
+            resource_owner_secret="fake-request-secret",
+            verifier="fake-verifier",
+        )
+
+    def _assert_state(self, sess, key, secret, verifier):
+        self.assertEqual(sess._client.client.resource_owner_key, key)
+        self.assertEqual(sess._client.client.resource_owner_secret, secret)
+        self.assertEqual(sess._client.client.verifier, verifier)
+
+    def test_parse_authorization_response_rejects_smuggled_secret(self):
+        sess = self._mid_handshake_session()
+        url = (
+            "https://i.b/callback?oauth_token=fake-request-token"
+            "&oauth_token_secret=attacker-secret&oauth_verifier=fake-verifier"
+        )
+        with self.assertRaises(ValueError):
+            sess.parse_authorization_response(url)
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_parse_authorization_response_rejects_duplicate_params(self):
+        sess = self._mid_handshake_session()
+        url = (
+            "https://i.b/callback?oauth_token=fake-request-token"
+            "&oauth_token=other-token&oauth_verifier=fake-verifier"
+        )
+        with self.assertRaises(ValueError):
+            sess.parse_authorization_response(url)
+        url = (
+            "https://i.b/callback?oauth_token=fake-request-token"
+            "&oauth_verifier=fake-verifier&oauth_verifier=other-verifier"
+        )
+        with self.assertRaises(ValueError):
+            sess.parse_authorization_response(url)
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_parse_authorization_response_rejects_missing_token(self):
+        sess = self._mid_handshake_session()
+        with self.assertRaises(TokenMissing):
+            sess.parse_authorization_response(
+                "https://i.b/callback?oauth_verifier=fake-verifier"
+            )
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_parse_authorization_response_rejects_missing_verifier(self):
+        sess = self._mid_handshake_session()
+        with self.assertRaises(VerifierMissing):
+            sess.parse_authorization_response(
+                "https://i.b/callback?oauth_token=fake-request-token"
+            )
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_fetch_token_endpoint_failure_preserves_state(self):
+        sess = self._mid_handshake_session()
+        for code in (400, 401, 403, 500):
+            sess.send = self.fake_body(
+                "oauth_token=fake-access-token"
+                "&oauth_token_secret=fake-access-secret",
+                code,
+            )
+            with self.assertRaises(TokenRequestDenied):
+                sess.fetch_access_token("https://example.com/token")
+            self._assert_state(
+                sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+            )
+
+    def test_fetch_token_missing_secret_preserves_state(self):
+        sess = self._mid_handshake_session()
+        sess.send = self.fake_body("oauth_token=fake-access-token")
+        with self.assertRaises(TokenMissing):
+            sess.fetch_access_token("https://example.com/token")
+        # no new token paired with the old secret
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_fetch_token_missing_token_preserves_state(self):
+        sess = self._mid_handshake_session()
+        sess.send = self.fake_body("oauth_token_secret=fake-access-secret")
+        with self.assertRaises(TokenMissing):
+            sess.fetch_access_token("https://example.com/token")
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_fetch_token_rejects_duplicate_params(self):
+        sess = self._mid_handshake_session()
+        sess.send = self.fake_body(
+            "oauth_token=fake-access-token&oauth_token=other-token"
+            "&oauth_token_secret=fake-access-secret"
+        )
+        with self.assertRaises(ValueError):
+            sess.fetch_access_token("https://example.com/token")
+        self._assert_state(
+            sess, "fake-request-token", "fake-request-secret", "fake-verifier"
+        )
+
+    def test_full_three_legged_handshake(self):
+        sess = OAuth1Session(
+            "fake-client-key",
+            client_secret="fake-client-secret",
+            callback_uri="https://i.b/callback",
+        )
+
+        # Step 1: temporary credentials come from the request token endpoint.
+        sess.send = self.fake_body(
+            "oauth_token=fake-request-token"
+            "&oauth_token_secret=fake-request-secret"
+        )
+        token = sess.fetch_request_token("https://i.b/request_token")
+        self.assertEqual(token["oauth_token"], "fake-request-token")
+        self.assertEqual(token["oauth_token_secret"], "fake-request-secret")
+
+        # Step 2: the user is redirected and comes back through the callback.
+        auth_url = sess.authorization_url("https://i.b/authorize")
+        self.assertIn("oauth_token=fake-request-token", auth_url)
+        resp = sess.parse_authorization_response(
+            "https://i.b/callback?oauth_token=fake-request-token"
+            "&oauth_verifier=fake-verifier"
+        )
+        self.assertEqual(resp["oauth_verifier"], "fake-verifier")
+        # the callback must not have touched the temporary secret
+        self.assertEqual(
+            sess._client.client.resource_owner_secret, "fake-request-secret"
+        )
+
+        # Step 3: final credentials come from the access token endpoint.
+        sess.send = self.fake_body(
+            "oauth_token=fake-access-token"
+            "&oauth_token_secret=fake-access-secret"
+        )
+        token = sess.fetch_access_token("https://i.b/access_token")
+        self.assertEqual(token["oauth_token"], "fake-access-token")
+        self.assertEqual(token["oauth_token_secret"], "fake-access-secret")
+        self.assertTrue(sess.authorized)
+
+        # Protected requests are signed with the final credentials.
+        sess.send = self.verify_signed_request("fake-access-token")
+        sess.post("https://i.b/resource")
+
+    def verify_signed_request(self, expected_token):
+        def fake_send(r, **kwargs):
+            auth_header = r.headers["Authorization"]
+            if isinstance(auth_header, bytes):
+                auth_header = auth_header.decode("utf-8")
+            self.assertIn('oauth_token="%s"' % expected_token, auth_header)
+            self.assertIn("oauth_signature", auth_header)
+            resp = mock.MagicMock(spec=requests.Response)
+            resp.cookies = []
+            return resp
+
+        return fake_send
 
     def test_token_proxy_set(self):
         token = {

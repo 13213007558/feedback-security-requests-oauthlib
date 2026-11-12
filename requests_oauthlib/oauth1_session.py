@@ -23,6 +23,25 @@ def urldecode(body):
         return json.loads(body)
 
 
+def _to_token_dict(decoded):
+    """Build a token dict from decoded parameters, rejecting duplicates.
+
+    A parameter that shows up more than once is ambiguous (parsers disagree
+    on whether the first or last value wins), so the whole response is
+    refused instead of silently picking one.
+    """
+    if isinstance(decoded, dict):
+        return decoded
+    token = {}
+    for key, value in decoded:
+        if key in token:
+            raise ValueError(
+                "Duplicate parameter {key!r} in response.".format(key=key)
+            )
+        token[key] = value
+    return token
+
+
 class TokenRequestDenied(ValueError):
     def __init__(self, message, response):
         super(TokenRequestDenied, self).__init__(message)
@@ -84,7 +103,6 @@ class OAuth1Session(requests.Session):
     >>> oauth_session.parse_authorization_response(redirect_response)
     {
         'oauth_token: 'kjerht2309u',
-        'oauth_token_secret: 'lsdajfh923874',
         'oauth_verifier: 'w34o8967345',
     }
     >>> oauth_session.fetch_access_token(access_token_url)
@@ -297,12 +315,11 @@ class OAuth1Session(requests.Session):
         consecutive requests.
 
         >>> access_token_url = 'https://api.twitter.com/oauth/access_token'
-        >>> redirect_response = 'https://127.0.0.1/callback?oauth_token=kjerht2309uf&oauth_token_secret=lsdajfh923874&oauth_verifier=w34o8967345'
+        >>> redirect_response = 'https://127.0.0.1/callback?oauth_token=kjerht2309uf&oauth_verifier=w34o8967345'
         >>> oauth_session = OAuth1Session('client-key', client_secret='secret')
         >>> oauth_session.parse_authorization_response(redirect_response)
         {
             'oauth_token: 'kjerht2309u',
-            'oauth_token_secret: 'lsdajfh923874',
             'oauth_verifier: 'w34o8967345',
         }
         >>> oauth_session.fetch_access_token(access_token_url)
@@ -323,24 +340,29 @@ class OAuth1Session(requests.Session):
     def parse_authorization_response(self, url):
         """Extract parameters from the post authorization redirect response URL.
 
+        The redirect comes from the user's browser and is therefore not
+        trusted with credentials: only ``oauth_token`` and ``oauth_verifier``
+        are accepted from it, and both are required. An ``oauth_token_secret``
+        smuggled into the callback, a duplicated parameter, or a missing
+        parameter causes the whole response to be rejected without changing
+        any previously established state.
+
         :param url: The full URL that resulted from the user being redirected
                     back from the OAuth provider to you, the client.
         :returns: A dict of parameters extracted from the URL.
 
-        >>> redirect_response = 'https://127.0.0.1/callback?oauth_token=kjerht2309uf&oauth_token_secret=lsdajfh923874&oauth_verifier=w34o8967345'
+        >>> redirect_response = 'https://127.0.0.1/callback?oauth_token=kjerht2309uf&oauth_verifier=w34o8967345'
         >>> oauth_session = OAuth1Session('client-key', client_secret='secret')
         >>> oauth_session.parse_authorization_response(redirect_response)
         {
             'oauth_token: 'kjerht2309u',
-            'oauth_token_secret: 'lsdajfh923874',
             'oauth_verifier: 'w34o8967345',
         }
         """
         log.debug("Parsing token from query part of url %s", url)
-        token = dict(urldecode(urlparse(url).query))
+        token = _to_token_dict(urldecode(urlparse(url).query))
         log.debug("Updating internal client token attribute.")
-        self._populate_attributes(token)
-        self.token = token
+        self._populate_attributes_from_callback(token)
         return token
 
     def _populate_attributes(self, token):
@@ -355,6 +377,54 @@ class OAuth1Session(requests.Session):
         if "oauth_verifier" in token:
             self._client.client.verifier = token["oauth_verifier"]
 
+    def _populate_attributes_from_callback(self, token):
+        """Update state from the (untrusted) authorization redirect.
+
+        Only the callback fields ``oauth_token`` and ``oauth_verifier`` may
+        be set here; secrets are never taken from the browser redirect.
+        Everything is validated before anything is assigned, so a rejected
+        callback leaves the previous state fully intact.
+        """
+        if "oauth_token_secret" in token:
+            raise ValueError(
+                "Callback response must not contain a token secret: "
+                "{resp}".format(resp=token)
+            )
+        if "oauth_token" not in token:
+            raise TokenMissing(
+                "Response does not contain a token: {resp}".format(resp=token),
+                token,
+            )
+        if "oauth_verifier" not in token:
+            raise VerifierMissing(
+                "Response does not contain a verifier: {resp}".format(resp=token)
+            )
+        self._client.client.resource_owner_key = token["oauth_token"]
+        self._client.client.verifier = token["oauth_verifier"]
+
+    def _populate_attributes_from_token_response(self, token):
+        """Update state from a (trusted) token endpoint response.
+
+        Both the temporary and the final token secret are only ever taken
+        from this channel. Token and secret are validated together and
+        assigned together, so a failure can never leave a new token paired
+        with a stale secret.
+        """
+        if "oauth_token" not in token:
+            raise TokenMissing(
+                "Response does not contain a token: {resp}".format(resp=token),
+                token,
+            )
+        if "oauth_token_secret" not in token:
+            raise TokenMissing(
+                "Response does not contain a token secret: {resp}".format(
+                    resp=token
+                ),
+                token,
+            )
+        self._client.client.resource_owner_key = token["oauth_token"]
+        self._client.client.resource_owner_secret = token["oauth_token_secret"]
+
     def _fetch_token(self, url, **request_kwargs):
         log.debug("Fetching token from %s using client %s", url, self._client.client)
         r = self.post(url, **request_kwargs)
@@ -365,7 +435,7 @@ class OAuth1Session(requests.Session):
 
         log.debug('Decoding token from response "%s"', r.text)
         try:
-            token = dict(urldecode(r.text.strip()))
+            token = _to_token_dict(urldecode(r.text.strip()))
         except ValueError as e:
             error = (
                 "Unable to decode token from token response. "
@@ -378,8 +448,7 @@ class OAuth1Session(requests.Session):
 
         log.debug("Obtained token %s", token)
         log.debug("Updating internal client attributes from token data.")
-        self._populate_attributes(token)
-        self.token = token
+        self._populate_attributes_from_token_response(token)
         return token
 
     def rebuild_auth(self, prepared_request, response):

@@ -1,4 +1,6 @@
 import logging
+import threading
+from urllib.parse import urlsplit
 
 from oauthlib.common import generate_token, urldecode
 from oauthlib.oauth2 import WebApplicationClient, InsecureTransportError
@@ -13,6 +15,122 @@ class TokenUpdated(Warning):
     def __init__(self, token):
         super(TokenUpdated, self).__init__()
         self.token = token
+
+
+class ComplianceHookError(RuntimeError):
+    """A compliance hook broke the hook execution contract.
+
+    :ivar condition: Stable name of the violated contract condition, for
+                     example ``"hook_return_value"``.
+    :ivar hook: The hook that violated the contract, when attributable.
+    :ivar cause: The original exception raised by the hook, if any. It is not
+                 chained into the traceback so request data carried by a
+                 provider exception cannot end up in diagnostics.
+    """
+
+    def __init__(self, condition, message, hook=None, cause=None):
+        super(ComplianceHookError, self).__init__(message)
+        self.condition = condition
+        self.hook = hook
+        self.cause = cause
+
+
+class ComplianceHookSecurityError(ComplianceHookError):
+    """A security postcondition failed after all compliance hooks ran."""
+
+
+def _hook_label(hook):
+    """Return a diagnostic label without rendering the hook or its closure."""
+    return (
+        getattr(hook, "__qualname__", None)
+        or getattr(hook, "__name__", None)
+        or type(hook).__name__
+    )
+
+
+_PRIMITIVE_CELL_TYPES = (type(None), bool, int, float, str, bytes)
+
+
+def _cell_key(cell):
+    try:
+        value = cell.cell_contents
+    except ValueError:
+        return ("empty",)
+    return _value_key(value)
+
+
+def _value_key(value):
+    if isinstance(value, _PRIMITIVE_CELL_TYPES):
+        return ("value", type(value), value)
+    if isinstance(value, tuple) and all(
+        isinstance(item, _PRIMITIVE_CELL_TYPES) for item in value
+    ):
+        return ("tuple", value)
+    return ("identity", id(value))
+
+
+def _hook_key(hook):
+    """Build an identity key used to make duplicate registration idempotent.
+
+    Plain callables are identified by their code object. Hooks created by the
+    same compliance-fix factory share that code object, so captured values
+    (including ``session``) and defaults are included too: applying the same
+    fix twice to the same session does not make the hook run twice, while
+    separately configured hooks from one factory stay distinct.
+    """
+    code = getattr(hook, "__code__", None)
+    if code is None:
+        return ("callable", id(hook))
+    closure_key = tuple(
+        _cell_key(cell) for cell in (getattr(hook, "__closure__", None) or ())
+    )
+    defaults_key = tuple(
+        _value_key(value) for value in (getattr(hook, "__defaults__", None) or ())
+    )
+    kwdefaults_key = tuple(
+        (name, _value_key(value))
+        for name, value in (getattr(hook, "__kwdefaults__", None) or {}).items()
+    )
+    self_obj = getattr(hook, "__self__", None)
+    self_key = ("none",) if self_obj is None else ("identity", id(self_obj))
+    return (
+        getattr(hook, "__module__", None),
+        getattr(hook, "__qualname__", None),
+        code,
+        self_key,
+        closure_key,
+        defaults_key,
+        kwdefaults_key,
+    )
+
+
+class _OrderedHookSet:
+    """Insertion-ordered, duplicate-safe collection of compliance hooks."""
+
+    def __init__(self):
+        self._hooks = []
+        self._keys = set()
+
+    def add(self, hook):
+        key = _hook_key(hook)
+        if key in self._keys:
+            log.debug("Ignoring duplicate compliance hook %s.", _hook_label(hook))
+            return False
+        self._keys.add(key)
+        self._hooks.append(hook)
+        return True
+
+    def __iter__(self):
+        return iter(self._hooks)
+
+    def __len__(self):
+        return len(self._hooks)
+
+    def __contains__(self, hook):
+        return any(existing is hook for existing in self._hooks)
+
+    def __repr__(self):
+        return repr(self._hooks)
 
 
 class OAuth2Session(requests.Session):
@@ -94,14 +212,21 @@ class OAuth2Session(requests.Session):
         self.auth = lambda r: r
 
         # Allow customizations for non compliant providers through various
-        # hooks to adjust requests and responses.
+        # hooks to adjust requests and responses. Hooks run in registration
+        # order and duplicate registrations are ignored; see
+        # ``register_compliance_hook`` for the execution contract.
         self.compliance_hook = {
-            "access_token_response": set(),
-            "refresh_token_response": set(),
-            "protected_request": set(),
-            "refresh_token_request": set(),
-            "access_token_request": set(),
+            "access_token_response": _OrderedHookSet(),
+            "refresh_token_response": _OrderedHookSet(),
+            "protected_request": _OrderedHookSet(),
+            "refresh_token_request": _OrderedHookSet(),
+            "access_token_request": _OrderedHookSet(),
         }
+
+        # State carried from ``request`` into ``send`` so redirect hops can be
+        # distinguished from the already-validated first transmission. It is
+        # thread-local because a Session may be shared across threads.
+        self._compliance_state = threading.local()
 
     @property
     def scope(self):
@@ -372,11 +497,30 @@ class OAuth2Session(requests.Session):
         else:
             raise ValueError("The method kwarg must be POST or GET.")
 
-        for hook in self.compliance_hook["access_token_request"]:
-            log.debug("Invoking access_token_request hook %s.", hook)
-            token_url, headers, request_kwargs = hook(
-                token_url, headers, request_kwargs
-            )
+        sensitive_values = []
+        if client_secret:
+            sensitive_values.append(client_secret)
+        password = getattr(auth, "password", None)
+        if isinstance(password, str) and password:
+            sensitive_values.append(password)
+
+        baseline = self._target_features(
+            token_url, params=request_kwargs.get("params")
+        )
+        baseline["sensitive_query"] = self._query_has_any(
+            baseline.get("query"), sensitive_values
+        )
+
+        token_url, headers, request_kwargs = self._run_compliance_hooks(
+            "access_token_request", token_url, headers, request_kwargs
+        )
+
+        self._assert_request_security(
+            token_url,
+            sensitive_values=sensitive_values,
+            params=request_kwargs.get("params"),
+            baseline=baseline,
+        )
 
         r = self.request(
             method=method,
@@ -387,25 +531,22 @@ class OAuth2Session(requests.Session):
             verify=verify,
             proxies=proxies,
             cert=cert,
+            _compliance_sensitive_values=sensitive_values,
             **request_kwargs
         )
 
         log.debug("Request to fetch token completed with status %s.", r.status_code)
-        log.debug("Request url was %s", r.request.url)
-        log.debug("Request headers were %s", r.request.headers)
-        log.debug("Request body was %s", r.request.body)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
+        log.debug("Request url was %s", self._redact_url(r.request.url))
+        log.debug("Response headers were %s.", r.headers)
         log.debug(
             "Invoking %d token response hooks.",
             len(self.compliance_hook["access_token_response"]),
         )
-        for hook in self.compliance_hook["access_token_response"]:
-            log.debug("Invoking hook %s.", hook)
-            r = hook(r)
+        r = self._run_compliance_response_hooks("access_token_response", r)
 
         self._client.parse_request_body_response(r.text, scope=self.scope)
         self.token = self._client.token
-        log.debug("Obtained token %s.", self.token)
+        log.debug("Obtained token from token endpoint.")
         return self.token
 
     def token_from_fragment(self, authorization_response):
@@ -454,14 +595,12 @@ class OAuth2Session(requests.Session):
 
         refresh_token = refresh_token or self.token.get("refresh_token")
 
-        log.debug(
-            "Adding auto refresh key word arguments %s.", self.auto_refresh_kwargs
-        )
+        log.debug("Adding auto refresh keyword arguments.")
         kwargs.update(self.auto_refresh_kwargs)
         body = self._client.prepare_refresh_body(
             body=body, refresh_token=refresh_token, scope=self.scope, **kwargs
         )
-        log.debug("Prepared refresh token request body %s", body)
+        log.debug("Prepared refresh token request body.")
 
         if headers is None:
             headers = {
@@ -469,9 +608,16 @@ class OAuth2Session(requests.Session):
                 "Content-Type": ("application/x-www-form-urlencoded"),
             }
 
-        for hook in self.compliance_hook["refresh_token_request"]:
-            log.debug("Invoking refresh_token_request hook %s.", hook)
-            token_url, headers, body = hook(token_url, headers, body)
+        token_url, headers, body = self._run_compliance_hooks(
+            "refresh_token_request", token_url, headers, body
+        )
+
+        sensitive_values = ()
+        password = getattr(auth, "password", None)
+        if isinstance(password, str) and password:
+            sensitive_values = (password,)
+
+        self._assert_request_security(token_url, sensitive_values=sensitive_values)
 
         r = self.post(
             token_url,
@@ -482,16 +628,15 @@ class OAuth2Session(requests.Session):
             verify=verify,
             withhold_token=True,
             proxies=proxies,
+            _compliance_sensitive_values=sensitive_values,
         )
         log.debug("Request to refresh token completed with status %s.", r.status_code)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
+        log.debug("Response headers were %s.", r.headers)
         log.debug(
             "Invoking %d token response hooks.",
             len(self.compliance_hook["refresh_token_response"]),
         )
-        for hook in self.compliance_hook["refresh_token_response"]:
-            log.debug("Invoking hook %s.", hook)
-            r = hook(r)
+        r = self._run_compliance_response_hooks("refresh_token_response", r)
 
         self.token = self._client.parse_request_body_response(r.text, scope=self.scope)
         if "refresh_token" not in self.token:
@@ -512,18 +657,32 @@ class OAuth2Session(requests.Session):
         **kwargs
     ):
         """Intercept all requests and add the OAuth 2 token if present."""
+        sensitive_values = kwargs.pop("_compliance_sensitive_values", ())
+        if client_secret:
+            sensitive_values = tuple(sensitive_values) + (client_secret,)
         if not is_secure_transport(url):
             raise InsecureTransportError()
+        baseline = self._target_features(url, params=kwargs.get("params"))
+        baseline["sensitive_query"] = self._query_has_any(
+            baseline.get("query"), sensitive_values
+        )
         if self.token and not withhold_token:
             log.debug(
                 "Invoking %d protected resource request hooks.",
                 len(self.compliance_hook["protected_request"]),
             )
-            for hook in self.compliance_hook["protected_request"]:
-                log.debug("Invoking hook %s.", hook)
-                url, headers, data = hook(url, headers, data)
+            url, headers, data = self._run_compliance_hooks(
+                "protected_request", url, headers, data
+            )
 
-            log.debug("Adding token %s to request.", self.token)
+            self._assert_request_security(
+                url,
+                sensitive_values=sensitive_values,
+                params=kwargs.get("params"),
+                baseline=baseline,
+            )
+
+            log.debug("Adding an access token to the request.")
             try:
                 url, headers, data = self._client.add_token(
                     url, http_method=method, body=data, headers=headers
@@ -540,17 +699,15 @@ class OAuth2Session(requests.Session):
                     auth = kwargs.pop("auth", None)
                     if client_id and client_secret and (auth is None):
                         log.debug(
-                            'Encoding client_id "%s" with client_secret as Basic auth credentials.',
-                            client_id,
+                            "Encoding client_id with client_secret as Basic "
+                            "auth credentials."
                         )
                         auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
                     token = self.refresh_token(
                         self.auto_refresh_url, auth=auth, **kwargs
                     )
                     if self.token_updater:
-                        log.debug(
-                            "Updating token to %s using %s.", token, self.token_updater
-                        )
+                        log.debug("Updating token using the token updater.")
                         self.token_updater(token)
                         url, headers, data = self._client.add_token(
                             url, http_method=method, body=data, headers=headers
@@ -560,12 +717,236 @@ class OAuth2Session(requests.Session):
                 else:
                     raise
 
-        log.debug("Requesting url %s using method %s.", url, method)
-        log.debug("Supplying headers %s and data %s", headers, data)
-        log.debug("Passing through key word arguments %s.", kwargs)
-        return super(OAuth2Session, self).request(
-            method, url, headers=headers, data=data, files=files, **kwargs
+        self._assert_request_security(
+            url,
+            sensitive_values=sensitive_values,
+            params=kwargs.get("params"),
+            baseline=baseline,
         )
+
+        log.debug(
+            "Requesting url %s using method %s.", self._redact_url(url), method
+        )
+        log.debug("Supplying %d request headers.", len(headers or {}))
+        log.debug("Passing through key word arguments %s.", kwargs)
+        # The final target was already validated above; remember its
+        # baseline so ``send`` can distinguish the first transmission from a
+        # redirect hop (``requests`` may normalize the URL before sending).
+        state = self._compliance_state
+        state.sensitive_values = tuple(sensitive_values)
+        state.first_hop_baseline = baseline
+        state.first_hop_pending = True
+        state.request_active = True
+        try:
+            return super(OAuth2Session, self).request(
+                method, url, headers=headers, data=data, files=files, **kwargs
+            )
+        finally:
+            state.sensitive_values = ()
+            state.first_hop_baseline = None
+            state.first_hop_pending = False
+            state.request_active = False
+
+    def send(self, request, **kwargs):
+        """Validate every prepared request, including redirect hops.
+
+        ``requests`` follows redirects by calling ``send`` again with a copied
+        prepared request. Checking here guarantees that a redirect target is
+        validated before it is transmitted, not after the response arrives.
+        """
+        url = getattr(request, "url", None)
+        if isinstance(url, str):
+            state = self._compliance_state
+            sensitive_values = getattr(state, "sensitive_values", ())
+            if getattr(state, "first_hop_pending", False):
+                baseline = getattr(state, "first_hop_baseline", None)
+                state.first_hop_pending = False
+                self._assert_request_security(
+                    url, sensitive_values=sensitive_values, baseline=baseline
+                )
+            elif not getattr(state, "request_active", False):
+                # A caller invoked ``send`` directly, bypassing ``request``.
+                # No compliance hook rewrote this target, so keep the
+                # historical transport error type while still rejecting it.
+                if not is_secure_transport(url):
+                    raise InsecureTransportError()
+            else:
+                # A redirect hop produced by ``requests``; no pre-hook
+                # baseline exists for it, so all postconditions apply.
+                self._assert_request_security(
+                    url, sensitive_values=sensitive_values
+                )
+        return super(OAuth2Session, self).send(request, **kwargs)
+
+    def _run_compliance_hooks(self, hook_type, *args):
+        """Run request-side hooks in registration order.
+
+        Hooks are invoked sequentially and must return a tuple with the same
+        arity as their input. The first failure stops execution; later hooks
+        are never invoked against partially transformed arguments.
+        """
+        for hook in self.compliance_hook[hook_type]:
+            label = _hook_label(hook)
+            log.debug("Invoking %s hook %s.", hook_type, label)
+            try:
+                result = hook(*args)
+            except ComplianceHookError:
+                raise
+            except Exception as exc:
+                raise ComplianceHookError(
+                    "hook_execution",
+                    "Compliance hook {} raised {}; execution stopped.".format(
+                        label, type(exc).__name__
+                    ),
+                    hook=hook,
+                    cause=exc,
+                ) from None
+            if not isinstance(result, tuple) or len(result) != len(args):
+                raise ComplianceHookError(
+                    "hook_return_value",
+                    "Compliance hook {} must return a {}-tuple, got {}.".format(
+                        label, len(args), type(result).__name__
+                    ),
+                    hook=hook,
+                )
+            args = result
+        return args
+
+    def _run_compliance_response_hooks(self, hook_type, response):
+        """Run response-side hooks in registration order."""
+        for hook in self.compliance_hook[hook_type]:
+            label = _hook_label(hook)
+            log.debug("Invoking %s hook %s.", hook_type, label)
+            try:
+                result = hook(response)
+            except ComplianceHookError:
+                raise
+            except Exception as exc:
+                raise ComplianceHookError(
+                    "hook_execution",
+                    "Compliance hook {} raised {}; execution stopped.".format(
+                        label, type(exc).__name__
+                    ),
+                    hook=hook,
+                    cause=exc,
+                ) from None
+            if result is None or not hasattr(result, "text"):
+                raise ComplianceHookError(
+                    "hook_return_value",
+                    "Compliance hook {} must return a response object, got {}.".format(
+                        label, type(result).__name__
+                    ),
+                    hook=hook,
+                )
+            response = result
+        return response
+
+    @staticmethod
+    def _redact_url(url):
+        """Render a URL without userinfo, query or fragment."""
+        if not isinstance(url, str):
+            return "<non-string-url>"
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+        except ValueError:
+            return "<unparseable-url>"
+        return "{}://{}{}".format(parts.scheme or "?", host, parts.path)
+
+    @staticmethod
+    def _target_features(url, params=None):
+        """Describe the security-relevant features of a request target."""
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return {"parseable": False}
+        query_parts = [parts.query] if parts.query else []
+        if isinstance(params, dict):
+            query_parts.extend(
+                "{}={}".format(key, value) for key, value in params.items()
+            )
+        elif isinstance(params, (list, tuple)):
+            query_parts.extend("{}={}".format(key, value) for key, value in params)
+        return {
+            "parseable": True,
+            "url": url,
+            "userinfo": parts.username is not None or parts.password is not None,
+            "fragment": bool(parts.fragment),
+            "query": "&".join(query_parts),
+        }
+
+    @staticmethod
+    def _query_has_any(query, sensitive_values):
+        """Return True if any sensitive value appears in an encoded query."""
+        if not query:
+            return False
+        from urllib.parse import unquote
+
+        haystack = unquote(query)
+        return any(
+            isinstance(secret, str) and secret and secret in haystack
+            for secret in sensitive_values
+        )
+
+    def _assert_request_security(
+        self, url, sensitive_values=(), params=None, baseline=None
+    ):
+        """Enforce security postconditions on the final request target.
+
+        This runs after every request-side compliance hook, immediately
+        before the request is handed to ``requests``. It exists because a
+        target that passed an earlier check may be rewritten by a later hook.
+        ``baseline`` is the result of :meth:`_target_features` computed before
+        hooks ran: pre-existing choices such as an explicit ``force_querystring``
+        are allowed, but hooks may not introduce a new violation.
+
+        Error messages name the violated condition and only include a
+        redacted target; request bodies, headers and query values are never
+        used as diagnostics.
+        """
+        features = self._target_features(url, params)
+        redacted = self._redact_url(url)
+        baseline = baseline or {}
+
+        if not features["parseable"]:
+            raise ComplianceHookSecurityError(
+                "url_parse",
+                "Condition 'url_parse' violated: compliance hooks produced "
+                "an unparseable request target.",
+            )
+
+        if not is_secure_transport(url):
+            raise ComplianceHookSecurityError(
+                "secure_transport",
+                "Condition 'secure_transport' violated: the final request "
+                "target {} is not HTTPS.".format(redacted),
+            )
+
+        if features["userinfo"] and not baseline.get("userinfo", False):
+            raise ComplianceHookSecurityError(
+                "url_userinfo",
+                "Condition 'url_userinfo' violated: the final request target "
+                "{} contains embedded credentials.".format(redacted),
+            )
+
+        if features["fragment"] and not baseline.get("fragment", False):
+            raise ComplianceHookSecurityError(
+                "url_fragment",
+                "Condition 'url_fragment' violated: the final request target "
+                "{} contains a fragment, which is not transmitted.".format(redacted),
+            )
+
+        if sensitive_values:
+            query_was_sensitive = baseline.get("sensitive_query", False)
+            if not query_was_sensitive and self._query_has_any(
+                features["query"], sensitive_values
+            ):
+                raise ComplianceHookSecurityError(
+                    "client_secret_in_url",
+                    "Condition 'client_secret_in_url' violated: the final "
+                    "request target {} carries a client secret in the query "
+                    "string.".format(redacted),
+                )
 
     def register_compliance_hook(self, hook_type, hook):
         """Register a hook for request/response tweaking.
@@ -576,6 +957,24 @@ class OAuth2Session(requests.Session):
             protected_request invoked before making a request.
             access_token_request invoked before making a token fetch request.
             refresh_token_request invoked before making a refresh request.
+
+        Execution contract:
+
+        - Hooks run sequentially in registration order, never in set order.
+        - Registering the same hook (or re-applying a compliance fix to the
+          same session) is idempotent: the hook runs once.
+        - Request-side hooks receive ``(url, headers, data)`` and must return
+          the same three values. Response-side hooks receive a response and
+          must return a response. The first hook that raises an exception or
+          returns an invalid value stops execution with
+          :class:`ComplianceHookError`; subsequent hooks do not run.
+        - Security postconditions (HTTPS transport, no embedded credentials,
+          no fragment, no client secret in the query string) are re-checked
+          after all hooks, immediately before the request is sent, and again
+          for every redirect hop before that hop is transmitted. Violations
+          raise :class:`ComplianceHookSecurityError`, whose ``condition``
+          names the failed check. Diagnostics contain only a redacted URL;
+          request bodies, headers and query values are never echoed.
 
         If you find a new hook is needed please send a GitHub PR request
         or open an issue.

@@ -1,6 +1,22 @@
 History
 -------
 
+Unreleased
+++++++++++
+
+Additions & changes:
+
+- Compliance hooks for ``OAuth2Session`` now run in registration order instead
+  of arbitrary ``set`` order, and duplicate registrations are ignored so
+  re-applying the same compliance fix is idempotent.
+- Hook failures are reported as ``ComplianceHookError`` with a ``condition``
+  attribute; the original exception is attached as ``cause`` without being
+  chained into diagnostics.
+- Security postconditions (HTTPS, no URL userinfo, no fragment, no client
+  secret in the query string) are re-checked after all hooks and before every
+  redirect hop. Violations raise ``ComplianceHookSecurityError`` naming the
+  failed condition; diagnostics use redacted URLs only.
+
 v2.0.0 (22 March 2024)
 ++++++++++++++++++++++++
 

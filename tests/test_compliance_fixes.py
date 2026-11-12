@@ -8,6 +8,10 @@ from urllib.parse import urlparse, parse_qs
 
 from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
 from requests_oauthlib import OAuth2Session
+from requests_oauthlib import (
+    ComplianceHookError,
+    ComplianceHookSecurityError,
+)
 from requests_oauthlib.compliance_fixes import facebook_compliance_fix
 from requests_oauthlib.compliance_fixes import fitbit_compliance_fix
 from requests_oauthlib.compliance_fixes import mailchimp_compliance_fix
@@ -385,3 +389,224 @@ class RefreshTokenRequestComplianceFixTest(TestCase):
             "https://example.com/refresh",
         )
         assert token["token_type"] == "Bearer"
+
+
+class ComplianceHookContractTest(TestCase):
+    """Offline tests for the compliance hook execution contract."""
+
+    def setUp(self):
+        self.mocker = requests_mock.Mocker()
+        self.mocker.get("https://api.example.com/resource", json={"ok": True})
+        self.mocker.post("https://api.example.com/token", json={"access_token": "t"})
+        self.mocker.start()
+        self.addCleanup(self.mocker.stop)
+
+        self.session = OAuth2Session("client-id", token={"access_token": "tok"})
+
+    def test_hooks_run_in_registration_order(self):
+        order = []
+
+        def first(url, headers, data):
+            order.append("first")
+            return url, headers, data
+
+        def second(url, headers, data):
+            order.append("second")
+            return url, headers, data
+
+        def third(url, headers, data):
+            order.append("third")
+            return url, headers, data
+
+        # Registration order differs from every plausible hash/set order.
+        for hook in (third, first, second):
+            self.session.register_compliance_hook("protected_request", hook)
+
+        self.session.get("https://api.example.com/resource")
+        self.assertEqual(order, ["third", "first", "second"])
+
+    def test_conflicting_hooks_last_registered_wins_deterministically(self):
+        def redirect_to_host_a(url, headers, data):
+            return "https://a.example.com/resource", headers, data
+
+        def redirect_to_host_b(url, headers, data):
+            return "https://b.example.com/resource", headers, data
+
+        self.mocker.get("https://b.example.com/resource", json={"ok": True})
+        self.session.register_compliance_hook("protected_request", redirect_to_host_a)
+        self.session.register_compliance_hook("protected_request", redirect_to_host_b)
+
+        response = self.session.get("https://api.example.com/resource")
+        self.assertEqual(response.request.url, "https://b.example.com/resource")
+
+    def test_duplicate_registration_runs_once(self):
+        calls = []
+
+        def hook(url, headers, data):
+            calls.append(url)
+            return url, headers, data
+
+        self.session.register_compliance_hook("protected_request", hook)
+        self.session.register_compliance_hook("protected_request", hook)
+        self.session.get("https://api.example.com/resource")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.session.compliance_hook["protected_request"]), 1)
+
+    def test_reapplying_compliance_fix_is_idempotent(self):
+        tracking = []
+
+        def _non_compliant_param_name(url, headers, data):
+            tracking.append("hook")
+            return url, headers, data
+
+        session = slack_compliance_fix(OAuth2Session("client-id"))
+        session.register_compliance_hook("protected_request", _non_compliant_param_name)
+        session.register_compliance_hook("protected_request", _non_compliant_param_name)
+        self.assertEqual(len(session.compliance_hook["protected_request"]), 2)
+        self.assertEqual(tracking, [])
+
+        # Re-applying the built-in fix to the same session does not add hooks.
+        slack_compliance_fix(session)
+        self.assertEqual(len(session.compliance_hook["protected_request"]), 2)
+
+    def test_hook_exception_stops_pipeline(self):
+        calls = []
+
+        def first(url, headers, data):
+            calls.append("first")
+            return url, headers, data
+
+        def broken(url, headers, data):
+            calls.append("broken")
+            raise RuntimeError("boom")
+
+        def never(url, headers, data):
+            calls.append("never")
+            return url, headers, data
+
+        for hook in (first, broken, never):
+            self.session.register_compliance_hook("protected_request", hook)
+
+        with self.assertRaises(ComplianceHookError) as ctx:
+            self.session.get("https://api.example.com/resource")
+
+        self.assertEqual(calls, ["first", "broken"])
+        self.assertEqual(ctx.exception.condition, "hook_execution")
+        self.assertIs(ctx.exception.hook, broken)
+        # The wrapped error must not leak the body or the token.
+        self.assertNotIn("tok", str(ctx.exception))
+        self.assertNotIn("boom", str(ctx.exception))
+        self.assertNotIn("resource", str(ctx.exception))
+        self.assertNotIn("Authorization", repr(ctx.exception))
+
+    def test_invalid_hook_return_stops_pipeline(self):
+        def broken(url, headers, data):
+            return url
+
+        self.session.register_compliance_hook("protected_request", broken)
+
+        with self.assertRaises(ComplianceHookError) as ctx:
+            self.session.get("https://api.example.com/resource")
+
+        self.assertEqual(ctx.exception.condition, "hook_return_value")
+        self.assertIs(ctx.exception.hook, broken)
+
+    def test_final_security_check_catches_hook_introduced_http(self):
+        def downgrade(url, headers, data):
+            return url.replace("https://", "http://"), headers, data
+
+        self.session.register_compliance_hook("protected_request", downgrade)
+
+        with self.assertRaises(ComplianceHookSecurityError) as ctx:
+            self.session.get("https://api.example.com/resource")
+
+        self.assertEqual(ctx.exception.condition, "secure_transport")
+        self.assertNotIn("access_token", str(ctx.exception))
+        self.assertNotIn("tok", str(ctx.exception))
+
+    def test_final_security_check_catches_credentials_in_url(self):
+        def embed(url, headers, data):
+            return "https://user:secret@api.example.com/resource", headers, data
+
+        self.session.register_compliance_hook("protected_request", embed)
+
+        with self.assertRaises(ComplianceHookSecurityError) as ctx:
+            self.session.get("https://api.example.com/resource")
+
+        self.assertEqual(ctx.exception.condition, "url_userinfo")
+        self.assertNotIn("secret", str(ctx.exception))
+
+    def test_final_security_check_catches_client_secret_in_query(self):
+        # A hook may not move the client secret into the final query string.
+        self.session.register_compliance_hook(
+            "access_token_request",
+            lambda url, headers, data: (
+                url + "?client_secret=topsecret",
+                headers,
+                data,
+            ),
+        )
+
+        with self.assertRaises(ComplianceHookSecurityError) as ctx:
+            self.session.fetch_token(
+                "https://api.example.com/token",
+                code="abc",
+                client_secret="topsecret",
+            )
+
+        self.assertEqual(ctx.exception.condition, "client_secret_in_url")
+        self.assertNotIn("topsecret", str(ctx.exception))
+
+    def test_existing_provider_adapters_still_work(self):
+        # Slack semantics preserved: token moved to body, not query.
+        slack = slack_compliance_fix(
+            OAuth2Session("client-id", token={"access_token": "dummy"})
+        )
+        self.mocker.get("https://slack.com/api/auth.test", json={"ok": True})
+        response = slack.get("https://slack.com/api/auth.test")
+        query = parse_qs(urlparse(response.request.url).query)
+        self.assertNotIn("token", query)
+        body = parse_qs(response.request.body)
+        self.assertEqual(body["token"], ["dummy"])
+
+        # Instagram semantics preserved: token added to query, override honored.
+        instagram = instagram_compliance_fix(
+            OAuth2Session("client-id", token={"access_token": "dummy"})
+        )
+        self.mocker.get("https://api.instagram.com/v1/users/self", json={"ok": True})
+        response = instagram.get("https://api.instagram.com/v1/users/self")
+        query = parse_qs(urlparse(response.request.url).query)
+        self.assertEqual(query["access_token"], ["dummy"])
+
+        # facebook response fix preserved.
+        facebook = facebook_compliance_fix(
+            OAuth2Session("client-id", redirect_uri="https://i.b")
+        )
+        self.mocker.post(
+            "https://graph.facebook.com/oauth/access_token",
+            text="access_token=urlencoded",
+            headers={"Content-Type": "text/plain"},
+        )
+        token = facebook.fetch_token(
+            "https://graph.facebook.com/oauth/access_token",
+            client_secret="someclientsecret",
+            authorization_response="https://i.b/?code=hello",
+        )
+        self.assertEqual(token["access_token"], "urlencoded")
+        self.assertEqual(token["token_type"], "Bearer")
+
+    def test_redirect_to_http_is_rejected_before_transmission(self):
+        self.mocker.get(
+            "https://api.example.com/resource",
+            status_code=302,
+            headers={"Location": "http://insecure.example.com/next"},
+        )
+        self.mocker.get("http://insecure.example.com/next", json={"ok": True})
+
+        with self.assertRaises(ComplianceHookSecurityError) as ctx:
+            self.session.get("https://api.example.com/resource")
+
+        self.assertEqual(ctx.exception.condition, "secure_transport")
+        self.assertNotIn("tok", str(ctx.exception))
+        # The insecure hop must never be transmitted.
+        self.assertEqual(self.mocker.call_count, 1)

@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 
 from oauthlib.common import generate_token, urldecode
 from oauthlib.oauth2 import WebApplicationClient, InsecureTransportError
@@ -7,6 +8,21 @@ from oauthlib.oauth2 import TokenExpiredError, is_secure_transport
 import requests
 
 log = logging.getLogger(__name__)
+
+
+_TOKEN_CLIENT_ATTRIBUTES = (
+    "token",
+    "access_token",
+    "refresh_token",
+    "token_type",
+    "expires_in",
+    "expires_at",
+    "_expires_at",
+    "mac_key",
+    "mac_algorithm",
+)
+
+_MISSING = object()
 
 
 class TokenUpdated(Warning):
@@ -85,6 +101,7 @@ class OAuth2Session(requests.Session):
         self.auto_refresh_kwargs = auto_refresh_kwargs or {}
         self.token_updater = token_updater
         self._pkce = pkce
+        self.last_token_audit = None
 
         if self._pkce not in ["S256", "plain", None]:
             raise AttributeError("Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce))
@@ -116,6 +133,37 @@ class OAuth2Session(requests.Session):
     @scope.setter
     def scope(self, scope):
         self._scope = scope
+
+    def _token_response_scope(self):
+        """Scope passed to oauthlib after the normalization boundary ran.
+
+        When the vendor adapter accepted the response it has already checked
+        that the grant is within the requested authorization range.  Passing
+        the granted scope avoids a duplicate warning for a narrower grant.
+        """
+        if getattr(self, "_token_scope_validated", False):
+            audit = self.last_token_audit
+            if audit is not None and audit.status == "accepted":
+                return list(audit.granted_scope or ())
+        return self.scope
+
+    def _snapshot_token_state(self):
+        """Capture token-bearing client state before an exchange mutates it."""
+        return {
+            name: deepcopy(getattr(self._client, name, _MISSING))
+            for name in _TOKEN_CLIENT_ATTRIBUTES
+        }
+
+    def _restore_token_state(self, snapshot):
+        """Restore the exact token state captured by _snapshot_token_state."""
+        for name, value in snapshot.items():
+            if value is _MISSING:
+                try:
+                    delattr(self._client, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self._client, name, deepcopy(value))
 
     def new_state(self):
         """Generates a state string to be used in authorizations."""
@@ -361,6 +409,8 @@ class OAuth2Session(requests.Session):
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
         }
+        token_snapshot = self._snapshot_token_state()
+        self.last_token_audit = None
         self.token = {}
         request_kwargs = {}
         if method.upper() == "POST":
@@ -378,33 +428,41 @@ class OAuth2Session(requests.Session):
                 token_url, headers, request_kwargs
             )
 
-        r = self.request(
-            method=method,
-            url=token_url,
-            timeout=timeout,
-            headers=headers,
-            auth=auth,
-            verify=verify,
-            proxies=proxies,
-            cert=cert,
-            **request_kwargs
-        )
+        try:
+            r = self.request(
+                method=method,
+                url=token_url,
+                timeout=timeout,
+                headers=headers,
+                auth=auth,
+                verify=verify,
+                proxies=proxies,
+                cert=cert,
+                **request_kwargs
+            )
 
-        log.debug("Request to fetch token completed with status %s.", r.status_code)
-        log.debug("Request url was %s", r.request.url)
-        log.debug("Request headers were %s", r.request.headers)
-        log.debug("Request body was %s", r.request.body)
-        log.debug("Response headers were %s and content %s.", r.headers, r.text)
-        log.debug(
-            "Invoking %d token response hooks.",
-            len(self.compliance_hook["access_token_response"]),
-        )
-        for hook in self.compliance_hook["access_token_response"]:
-            log.debug("Invoking hook %s.", hook)
-            r = hook(r)
+            log.debug(
+                "Request to fetch token completed with status %s.", r.status_code
+            )
+            log.debug("Request url was %s", r.request.url)
+            log.debug("Request headers were %s", r.request.headers)
+            log.debug("Request body was %s", r.request.body)
+            log.debug("Response headers were %s and content %s.", r.headers, r.text)
+            log.debug(
+                "Invoking %d token response hooks.",
+                len(self.compliance_hook["access_token_response"]),
+            )
+            for hook in self.compliance_hook["access_token_response"]:
+                log.debug("Invoking hook %s.", hook)
+                r = hook(r)
 
-        self._client.parse_request_body_response(r.text, scope=self.scope)
-        self.token = self._client.token
+            self._client.parse_request_body_response(
+                r.text, scope=self._token_response_scope()
+            )
+            self.token = self._client.token
+        except Exception:
+            self._restore_token_state(token_snapshot)
+            raise
         log.debug("Obtained token %s.", self.token)
         return self.token
 
@@ -489,14 +547,22 @@ class OAuth2Session(requests.Session):
             "Invoking %d token response hooks.",
             len(self.compliance_hook["refresh_token_response"]),
         )
-        for hook in self.compliance_hook["refresh_token_response"]:
-            log.debug("Invoking hook %s.", hook)
-            r = hook(r)
+        token_snapshot = self._snapshot_token_state()
+        self.last_token_audit = None
+        try:
+            for hook in self.compliance_hook["refresh_token_response"]:
+                log.debug("Invoking hook %s.", hook)
+                r = hook(r)
 
-        self.token = self._client.parse_request_body_response(r.text, scope=self.scope)
-        if "refresh_token" not in self.token:
-            log.debug("No new refresh token given. Re-using old.")
-            self.token["refresh_token"] = refresh_token
+            self.token = self._client.parse_request_body_response(
+                r.text, scope=self._token_response_scope()
+            )
+            if "refresh_token" not in self.token:
+                log.debug("No new refresh token given. Re-using old.")
+                self.token["refresh_token"] = refresh_token
+        except Exception:
+            self._restore_token_state(token_snapshot)
+            raise
         return self.token
 
     def request(

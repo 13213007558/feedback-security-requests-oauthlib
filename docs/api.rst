@@ -35,3 +35,12 @@ OAuth 2.0 Session
 
 .. autoclass:: OAuth2Session
     :members:
+
+
+Token response normalization
+----------------------------
+
+.. automodule:: requests_oauthlib.token_normalization
+    :members: TokenNormalizationAudit, TokenResponseError,
+              inspect_vendor_token_response, normalize_vendor_token_response,
+              vendor_token_compliance_fix

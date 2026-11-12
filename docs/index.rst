@@ -76,6 +76,7 @@ Getting Started:
    examples/examples
 
    api
+   token_normalization_migration
    contributing
    contributing_examples
 

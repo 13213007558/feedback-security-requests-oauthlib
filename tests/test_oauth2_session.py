@@ -15,7 +15,10 @@ from oauthlib.oauth2 import MismatchingStateError
 from oauthlib.oauth2 import WebApplicationClient, MobileApplicationClient
 from oauthlib.oauth2 import LegacyApplicationClient, BackendApplicationClient
 from requests_oauthlib import OAuth2Session, TokenUpdated
+from requests_oauthlib import AudienceBindingPolicy, AudienceViolationError
 import requests
+from requests.adapters import HTTPAdapter
+from requests.models import Response
 
 from requests.auth import _basic_auth_str
 
@@ -552,3 +555,375 @@ class OAuth2SessionNetrcTest(OAuth2SessionTest):
         if self.prehome is not None:
             os.environ["HOME"] = self.prehome
         shutil.rmtree(self.homedir)
+
+
+class RecordingHTTPAdapter(HTTPAdapter):
+    """In-memory adapter that records every request actually transmitted.
+
+    Routes map a URL prefix to a ``(status_code, location)`` tuple; when a
+    ``location`` is returned the regular requests redirect machinery drives
+    the next hop back through this adapter, which records it as well.
+    """
+
+    def __init__(self, routes=None, default_status=200, json_body=None):
+        super(RecordingHTTPAdapter, self).__init__()
+        self.routes = routes or {}
+        self.default_status = default_status
+        self.json_body = json_body
+        self.sent = []
+
+    def send(self, request, **kwargs):
+        self.sent.append(request)
+
+        response = Response()
+        response.status_code = self.default_status
+        location = None
+        for prefix, spec in self.routes.items():
+            if request.url.startswith(prefix):
+                response.status_code = spec[0]
+                if len(spec) > 1:
+                    location = spec[1]
+                break
+        if location is not None:
+            response.headers["Location"] = location
+        if self.json_body is not None:
+            response._content = json.dumps(self.json_body).encode()
+        response.url = request.url
+        response.request = request
+        response.raw = mock.MagicMock()
+        response.raw._original_response = None
+        return response
+
+
+def _audience_session(audience, routes=None, token=None, **kwargs):
+    token = token or {
+        "token_type": "Bearer",
+        "access_token": "secret-access-token",
+        "expires_in": 3600,
+    }
+    session = OAuth2Session(token=token, audience=audience, **kwargs)
+    adapter = RecordingHTTPAdapter(routes)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session, adapter
+
+
+class AudienceBindingPolicyTest(TestCase):
+    def test_matches_scheme_host_port_and_path_scope(self):
+        policy = AudienceBindingPolicy(["https://svc.internal:8443/api/v1"])
+        self.assertTrue(policy.allows("https://svc.internal:8443/api/v1"))
+        self.assertTrue(
+            policy.allows("https://svc.internal:8443/api/v1/items?x=1#frag")
+        )
+        # query string and fragment never widen the audience
+        self.assertTrue(policy.allows("https://svc.internal:8443/api/v1?x=1"))
+        # same host, different port is a different audience
+        self.assertFalse(policy.allows("https://svc.internal:9443/api/v1/items"))
+        self.assertFalse(policy.allows("http://svc.internal:8443/api/v1/items"))
+        # path prefix is segment based, no string-prefix shortcut
+        self.assertFalse(policy.allows("https://svc.internal:8443/api/v1other"))
+        self.assertFalse(policy.allows("https://svc.internal:8443/api/v2/x"))
+        self.assertFalse(policy.allows("https://other.host:8443/api/v1/x"))
+
+    def test_default_ports_are_normalized(self):
+        policy = AudienceBindingPolicy(["https://svc.internal/v1"])
+        self.assertTrue(policy.allows("https://svc.internal:443/v1/x"))
+        self.assertFalse(policy.allows("https://svc.internal:8443/v1/x"))
+
+    def test_accepts_several_audiences(self):
+        policy = AudienceBindingPolicy(
+            ["https://a.internal/v1", "https://b.internal/v2"]
+        )
+        self.assertTrue(policy.allows("https://a.internal/v1/items"))
+        self.assertTrue(policy.allows("https://b.internal/v2/items"))
+        self.assertFalse(policy.allows("https://a.internal/v2/items"))
+
+    def test_rejects_bad_arguments(self):
+        self.assertRaises(ValueError, AudienceBindingPolicy, [])
+        self.assertRaises(
+            ValueError, AudienceBindingPolicy, ["not-an-absolute-url"]
+        )
+        self.assertRaises(
+            ValueError,
+            AudienceBindingPolicy,
+            ["https://a.internal/"],
+            on_violation="explode",
+        )
+
+    def test_callable_policy(self):
+        policy = AudienceBindingPolicy.from_callable(
+            lambda url: url.startswith("https://svc.internal/v1/")
+        )
+        self.assertTrue(policy.allows("https://svc.internal/v1/items"))
+        self.assertFalse(policy.allows("https://svc.internal/v2/items"))
+
+    def test_build_audience_policy_coercion(self):
+        from requests_oauthlib.audience import build_audience_policy
+
+        self.assertIsNone(build_audience_policy(None))
+        policy = AudienceBindingPolicy(["https://a.internal/"])
+        self.assertIs(build_audience_policy(policy), policy)
+        self.assertIsInstance(
+            build_audience_policy("https://a.internal/"), AudienceBindingPolicy
+        )
+        self.assertIsInstance(
+            build_audience_policy(lambda url: True), AudienceBindingPolicy
+        )
+
+
+class OAuth2SessionAudienceTest(TestCase):
+    AUDIENCE = ["https://svc.internal:8443/api"]
+    BEARER = "Bearer secret-access-token"
+
+    def _recorded(self, adapter, url):
+        matches = [r for r in adapter.sent if r.url.startswith(url)]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    def test_allowed_audience_receives_bearer_token(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        session.get("https://svc.internal:8443/api/items")
+        request = self._recorded(adapter, "https://svc.internal:8443/api/items")
+        self.assertEqual(request.headers.get("Authorization"), self.BEARER)
+
+    def test_same_host_different_port_is_denied(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        session.get("https://svc.internal:9443/api/items")
+        request = self._recorded(adapter, "https://svc.internal:9443")
+        self.assertNotIn("Authorization", request.headers)
+        self.assertNotIn("Proxy-Authorization", request.headers)
+
+    def test_path_scope_is_enforced(self):
+        session, adapter = _audience_session(["https://svc.internal/api/v1"])
+        session.get("https://svc.internal/api/v1/items")
+        session.get("https://svc.internal/api/v1other")
+        session.get("https://svc.internal/api/v2/items")
+
+        allowed = self._recorded(
+            adapter, "https://svc.internal/api/v1/items"
+        )
+        self.assertEqual(allowed.headers.get("Authorization"), self.BEARER)
+        for url in (
+            "https://svc.internal/api/v1other",
+            "https://svc.internal/api/v2/items",
+        ):
+            denied = self._recorded(adapter, url)
+            self.assertNotIn("Authorization", denied.headers)
+
+    def test_denied_request_is_still_sent_without_credentials(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        response = session.get("https://svc.internal:9443/api/items")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertNotIn("Authorization", adapter.sent[0].headers)
+
+    def test_explicit_withhold_token_within_audience(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        session.get("https://svc.internal:8443/api/items", withhold_token=True)
+        request = self._recorded(adapter, "https://svc.internal:8443/api/items")
+        self.assertNotIn("Authorization", request.headers)
+
+    def test_tokenless_request_to_denied_target_still_executes(self):
+        session = OAuth2Session(audience=self.AUDIENCE)
+        adapter = RecordingHTTPAdapter()
+        session.mount("https://", adapter)
+        response = session.get("https://svc.internal:9443/api/items")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertNotIn("Authorization", adapter.sent[0].headers)
+
+    def test_redirect_to_denied_port_loses_token(self):
+        routes = {
+            "https://svc.internal:8443/api/start": (
+                302,
+                "https://svc.internal:9443/api/final",
+            )
+        }
+        session, adapter = _audience_session(self.AUDIENCE, routes=routes)
+        response = session.get("https://svc.internal:8443/api/start")
+
+        self.assertEqual(len(adapter.sent), 2)
+        self.assertEqual(
+            adapter.sent[0].headers.get("Authorization"), self.BEARER
+        )
+        self.assertNotIn("Authorization", adapter.sent[1].headers)
+        self.assertEqual(
+            response.url, "https://svc.internal:9443/api/final"
+        )
+
+    def test_redirect_leaving_path_scope_loses_token(self):
+        # Same host and port: requests itself would keep the Authorization
+        # header, so the audience policy is the only line of defense.
+        routes = {
+            "https://svc.internal:8443/api/start": (
+                302,
+                "https://svc.internal:8443/other/final",
+            )
+        }
+        session, adapter = _audience_session(self.AUDIENCE, routes=routes)
+        response = session.get("https://svc.internal:8443/api/start")
+
+        self.assertEqual(len(adapter.sent), 2)
+        self.assertEqual(
+            adapter.sent[0].headers.get("Authorization"), self.BEARER
+        )
+        self.assertNotIn("Authorization", adapter.sent[1].headers)
+        self.assertEqual(response.url, "https://svc.internal:8443/other/final")
+
+    def test_redirect_within_audience_keeps_token(self):
+        routes = {
+            "https://svc.internal:8443/api/start": (
+                302,
+                "https://svc.internal:8443/api/final",
+            )
+        }
+        session, adapter = _audience_session(self.AUDIENCE, routes=routes)
+        session.get("https://svc.internal:8443/api/start")
+        self.assertEqual(len(adapter.sent), 2)
+        for request in adapter.sent:
+            self.assertEqual(
+                request.headers.get("Authorization"), self.BEARER
+            )
+
+    def test_compliance_hook_redirected_to_denied_target(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+
+        def rewrite_to_denied(url, headers, data):
+            return "https://evil.internal/collect", headers, data
+
+        session.register_compliance_hook("protected_request", rewrite_to_denied)
+        session.get("https://svc.internal:8443/api/items")
+
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(adapter.sent[0].url, "https://evil.internal/collect")
+        self.assertNotIn("Authorization", adapter.sent[0].headers)
+
+    def test_basic_auth_credentials_are_withheld(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        session.get(
+            "https://svc.internal:9443/api/items",
+            auth=("someclientid", "someclientsecret"),
+        )
+        request = self._recorded(adapter, "https://svc.internal:9443")
+        self.assertNotIn("Authorization", request.headers)
+
+    def test_proxy_authorization_header_is_withheld(self):
+        session, adapter = _audience_session(self.AUDIENCE)
+        session.get(
+            "https://svc.internal:9443/api/items",
+            headers={"Proxy-Authorization": "Bearer proxy-token"},
+        )
+        request = self._recorded(adapter, "https://svc.internal:9443")
+        self.assertNotIn("Proxy-Authorization", request.headers)
+
+    def test_fetch_token_to_denied_endpoint_strips_client_credentials(self):
+        token = {
+            "token_type": "Bearer",
+            "access_token": "new-token",
+            "expires_in": 3600,
+        }
+        session = OAuth2Session(
+            client=BackendApplicationClient("someclientid"),
+            audience=self.AUDIENCE,
+        )
+        adapter = RecordingHTTPAdapter(json_body=token)
+        session.mount("https://", adapter)
+
+        session.fetch_token(
+            "https://token.evil.test/token",
+            include_client_id=True,
+            client_secret="someclientsecret",
+        )
+
+        self.assertEqual(len(adapter.sent), 1)
+        request = adapter.sent[0]
+        self.assertNotIn("Authorization", request.headers)
+        self.assertNotIn("client_id", request.body)
+        self.assertNotIn("client_secret", request.body)
+        self.assertIn("grant_type=client_credentials", request.body)
+
+    def test_raise_mode_blocks_denied_request(self):
+        session, adapter = _audience_session(
+            self.AUDIENCE, on_audience_violation="raise"
+        )
+        self.assertRaises(
+            AudienceViolationError,
+            session.get,
+            "https://svc.internal:9443/api/items",
+        )
+        self.assertEqual(adapter.sent, [])
+
+    def test_raise_mode_blocks_denied_redirect_hop(self):
+        routes = {
+            "https://svc.internal:8443/api/start": (
+                302,
+                "https://evil.internal/final",
+            )
+        }
+        session, adapter = _audience_session(
+            self.AUDIENCE, routes=routes, on_audience_violation="raise"
+        )
+        self.assertRaises(
+            AudienceViolationError,
+            session.get,
+            "https://svc.internal:8443/api/start",
+        )
+        # The first, approved hop was sent; the denied redirect never was.
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(
+            adapter.sent[0].headers.get("Authorization"), self.BEARER
+        )
+
+    def test_refresh_token_to_denied_endpoint_strips_client_credentials(self):
+        token = {
+            "token_type": "Bearer",
+            "access_token": "secret-access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+        }
+        session = OAuth2Session(token=token, audience=self.AUDIENCE)
+        adapter = RecordingHTTPAdapter(json_body=token)
+        session.mount("https://", adapter)
+
+        session.refresh_token(
+            "https://auth.evil.test/refresh",
+            auth=("someclientid", "someclientsecret"),
+        )
+
+        self.assertEqual(len(adapter.sent), 1)
+        request = adapter.sent[0]
+        self.assertNotIn("Authorization", request.headers)
+        self.assertIn("grant_type=refresh_token", request.body)
+
+    def test_callable_audience_is_supported(self):
+        session, adapter = _audience_session(
+            lambda url: url.startswith("https://svc.internal:8443/api/")
+        )
+        session.get("https://svc.internal:8443/api/items")
+        session.get("https://svc.internal:9443/api/items")
+        self.assertEqual(
+            adapter.sent[0].headers.get("Authorization"), self.BEARER
+        )
+        self.assertNotIn("Authorization", adapter.sent[1].headers)
+
+    def test_existing_policy_object_is_supported(self):
+        policy = AudienceBindingPolicy(self.AUDIENCE)
+        session, adapter = _audience_session(policy)
+        self.assertIs(session.audience_policy, policy)
+        session.get("https://svc.internal:9443/api/items")
+        self.assertNotIn("Authorization", adapter.sent[0].headers)
+
+    def test_no_audience_keeps_legacy_behavior(self):
+        session = OAuth2Session(
+            token={
+                "token_type": "Bearer",
+                "access_token": "secret-access-token",
+                "expires_in": 3600,
+            }
+        )
+        adapter = RecordingHTTPAdapter()
+        session.mount("https://", adapter)
+        session.get("https://any-host.example/whatever")
+        self.assertEqual(
+            adapter.sent[0].headers.get("Authorization"), self.BEARER
+        )

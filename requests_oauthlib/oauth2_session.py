@@ -6,6 +6,12 @@ from oauthlib.oauth2 import LegacyApplicationClient
 from oauthlib.oauth2 import TokenExpiredError, is_secure_transport
 import requests
 
+from .audience import (
+    AudienceViolationError,
+    build_audience_policy,
+    withhold_credentials,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -45,6 +51,8 @@ class OAuth2Session(requests.Session):
         state=None,
         token_updater=None,
         pkce=None,
+        audience=None,
+        on_audience_violation="withhold",
         **kwargs
     ):
         """Construct a new OAuth 2 client session.
@@ -72,6 +80,21 @@ class OAuth2Session(requests.Session):
                         has been refreshed. This warning will carry the token
                         in its token argument.
         :param pkce: Set "S256" or "plain" to enable PKCE. Default is disabled.
+        :param audience: Optional audience binding that restricts which URLs
+                         may receive the access token or client credentials.
+                         Accepts a single absolute URL prefix, a collection of
+                         URL prefixes, a callable ``url -> bool`` or a ready
+                         made :class:`AudienceBindingPolicy`. Scheme, host,
+                         port and path scope are all matched, so the same host
+                         on a different port, or a different path prefix, is a
+                         different audience. ``None`` (the default) leaves the
+                         session unrestricted.
+        :param on_audience_violation: What to do when a request leaves the
+                         approved audience. ``"withhold"`` (the default)
+                         strips every credential and sends the request
+                         unauthenticated; ``"raise"`` raises
+                         :class:`AudienceViolationError`. Ignored when
+                         ``audience`` is already a policy object.
         :param kwargs: Arguments to pass to the Session constructor.
         """
         super(OAuth2Session, self).__init__(**kwargs)
@@ -85,6 +108,9 @@ class OAuth2Session(requests.Session):
         self.auto_refresh_kwargs = auto_refresh_kwargs or {}
         self.token_updater = token_updater
         self._pkce = pkce
+        self.audience_policy = build_audience_policy(
+            audience, on_violation=on_audience_violation
+        )
 
         if self._pkce not in ["S256", "plain", None]:
             raise AttributeError("Wrong value for {}(.., pkce={})".format(self.__class__, self._pkce))
@@ -499,6 +525,31 @@ class OAuth2Session(requests.Session):
             self.token["refresh_token"] = refresh_token
         return self.token
 
+    def _enforce_audience(self, url, headers, data, kwargs):
+        """Apply the audience policy before any credential is attached.
+
+        The check also runs after the compliance hooks so a hook rewriting
+        the target URL cannot smuggle the token outside the approved
+        audience.
+
+        :return: A ``(allowed, data)`` tuple. ``allowed`` is ``True`` when
+                 the URL may carry credentials; otherwise credentials are
+                 stripped and ``data`` is the sanitized request body.
+        """
+        policy = self.audience_policy
+        if policy is None or policy.allows(url):
+            return True, data
+
+        log.debug("URL %s is outside the approved audience.", url)
+        if policy.on_violation == "raise":
+            raise AudienceViolationError(
+                "Refusing to send credentials to %s: it is not part of the "
+                "approved audience %s." % (url, policy.audiences)
+            )
+
+        data = withhold_credentials(headers, data, kwargs)
+        return False, data
+
     def request(
         self,
         method,
@@ -514,6 +565,15 @@ class OAuth2Session(requests.Session):
         """Intercept all requests and add the OAuth 2 token if present."""
         if not is_secure_transport(url):
             raise InsecureTransportError()
+
+        # Decide the audience up front. Compliance hooks may still rewrite
+        # the URL below, so it is re-checked once they have run.
+        audience_allows, data = self._enforce_audience(
+            url, headers, data, kwargs
+        )
+        if not audience_allows:
+            withhold_token = True
+
         if self.token and not withhold_token:
             log.debug(
                 "Invoking %d protected resource request hooks.",
@@ -523,42 +583,56 @@ class OAuth2Session(requests.Session):
                 log.debug("Invoking hook %s.", hook)
                 url, headers, data = hook(url, headers, data)
 
-            log.debug("Adding token %s to request.", self.token)
-            try:
-                url, headers, data = self._client.add_token(
-                    url, http_method=method, body=data, headers=headers
-                )
-            # Attempt to retrieve and save new access token if expired
-            except TokenExpiredError:
-                if self.auto_refresh_url:
-                    log.debug(
-                        "Auto refresh is set, attempting to refresh at %s.",
-                        self.auto_refresh_url,
-                    )
+            # A hook can change the final destination; the token must follow
+            # the audience policy rather than the original URL.
+            audience_allows, data = self._enforce_audience(
+                url, headers, data, kwargs
+            )
+            if not audience_allows:
+                withhold_token = True
 
-                    # We mustn't pass auth twice.
-                    auth = kwargs.pop("auth", None)
-                    if client_id and client_secret and (auth is None):
-                        log.debug(
-                            'Encoding client_id "%s" with client_secret as Basic auth credentials.',
-                            client_id,
-                        )
-                        auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
-                    token = self.refresh_token(
-                        self.auto_refresh_url, auth=auth, **kwargs
+            if not withhold_token:
+                log.debug("Adding token %s to request.", self.token)
+                try:
+                    url, headers, data = self._client.add_token(
+                        url, http_method=method, body=data, headers=headers
                     )
-                    if self.token_updater:
+                # Attempt to retrieve and save new access token if expired
+                except TokenExpiredError:
+                    if self.auto_refresh_url:
                         log.debug(
-                            "Updating token to %s using %s.", token, self.token_updater
+                            "Auto refresh is set, attempting to refresh at %s.",
+                            self.auto_refresh_url,
                         )
-                        self.token_updater(token)
-                        url, headers, data = self._client.add_token(
-                            url, http_method=method, body=data, headers=headers
+
+                        # We mustn't pass auth twice.
+                        auth = kwargs.pop("auth", None)
+                        if client_id and client_secret and (auth is None):
+                            log.debug(
+                                'Encoding client_id "%s" with client_secret as Basic auth credentials.',
+                                client_id,
+                            )
+                            auth = requests.auth.HTTPBasicAuth(
+                                client_id, client_secret
+                            )
+                        token = self.refresh_token(
+                            self.auto_refresh_url, auth=auth, **kwargs
                         )
+                        if self.token_updater:
+                            log.debug(
+                                "Updating token to %s using %s.",
+                                token,
+                                self.token_updater,
+                            )
+                            self.token_updater(token)
+                            url, headers, data = self._client.add_token(
+                                url, http_method=method, body=data,
+                                headers=headers,
+                            )
+                        else:
+                            raise TokenUpdated(token)
                     else:
-                        raise TokenUpdated(token)
-                else:
-                    raise
+                        raise
 
         log.debug("Requesting url %s using method %s.", url, method)
         log.debug("Supplying headers %s and data %s", headers, data)
@@ -566,6 +640,30 @@ class OAuth2Session(requests.Session):
         return super(OAuth2Session, self).request(
             method, url, headers=headers, data=data, files=files, **kwargs
         )
+
+    def send(self, request, **kwargs):
+        """Enforce the audience policy on every transmitted HTTP hop.
+
+        Redirects are followed inside :class:`requests.Session` and never
+        pass through :meth:`request` again, so the prepared URL of each hop
+        (including the final redirect target) is checked here. Requests
+        leaving the audience lose their credential headers before reaching
+        the connection adapter.
+        """
+        policy = self.audience_policy
+        if policy is not None and not policy.allows(request.url):
+            log.debug(
+                "Withholding credential headers from %s on send.", request.url
+            )
+            if policy.on_violation == "raise":
+                raise AudienceViolationError(
+                    "Refusing to send credentials to %s: it is not part of "
+                    "the approved audience %s."
+                    % (request.url, policy.audiences)
+                )
+            request.headers.pop("Authorization", None)
+            request.headers.pop("Proxy-Authorization", None)
+        return super(OAuth2Session, self).send(request, **kwargs)
 
     def register_compliance_hook(self, hook_type, hook):
         """Register a hook for request/response tweaking.

@@ -30,6 +30,20 @@ OAuth 2.0
     :members:
 
 
+Audience Binding
+----------------
+
+.. autoclass:: AudienceBindingPolicy
+    :members:
+
+.. autoclass:: AudienceViolationError
+    :members:
+
+.. autofunction:: requests_oauthlib.audience.build_audience_policy
+
+.. autofunction:: requests_oauthlib.audience.withhold_credentials
+
+
 OAuth 2.0 Session
 -----------------
 

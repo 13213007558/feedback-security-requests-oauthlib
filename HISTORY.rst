@@ -1,6 +1,18 @@
 History
 -------
 
+Unreleased
+++++++++++
+
+- Add optional audience binding to ``OAuth2Session``. The new ``audience``
+  constructor argument accepts URL prefixes, a callable or an
+  ``AudienceBindingPolicy`` and restricts which destinations may receive the
+  access token or client credentials. The policy is enforced before the
+  request is prepared (including after compliance hooks rewrite the URL) and
+  again on every redirect hop. By default credentials are withheld and the
+  request continues unauthenticated; pass ``on_audience_violation="raise"``
+  to fail closed with ``AudienceViolationError`` instead.
+
 v2.0.0 (22 March 2024)
 ++++++++++++++++++++++++
 
